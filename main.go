@@ -31,29 +31,17 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"net"
-	"net/url"
-	"os"
-	"os/signal"
-	"strings"
-	"syscall"
-	"time"
-
 	nested "github.com/antonfisher/nested-logrus-formatter"
+	"github.com/containerd/containerd"
+	"github.com/containerd/containerd/namespaces"
 	"github.com/edwarnicke/grpcfd"
 	"github.com/kelseyhightower/envconfig"
-	"github.com/sirupsen/logrus"
-	"github.com/spiffe/go-spiffe/v2/spiffetls/tlsconfig"
-	"github.com/spiffe/go-spiffe/v2/svid/x509svid"
-	"github.com/spiffe/go-spiffe/v2/workloadapi"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials"
-
-	kernelheal "github.com/networkservicemesh/sdk-kernel/pkg/kernel/tools/heal"
-
 	"github.com/networkservicemesh/api/pkg/api/networkservice"
 	kernelmech "github.com/networkservicemesh/api/pkg/api/networkservice/mechanisms/kernel"
 	vfiomech "github.com/networkservicemesh/api/pkg/api/networkservice/mechanisms/vfio"
+	"github.com/networkservicemesh/cmd-nsc/internal/config"
+	netnspb "github.com/networkservicemesh/cmd-nsc/pkg/netns"
+	kernelheal "github.com/networkservicemesh/sdk-kernel/pkg/kernel/tools/heal"
 	"github.com/networkservicemesh/sdk-sriov/pkg/networkservice/common/mechanisms/vfio"
 	sriovtoken "github.com/networkservicemesh/sdk-sriov/pkg/networkservice/common/token"
 	"github.com/networkservicemesh/sdk/pkg/networkservice/chains/client"
@@ -67,17 +55,7 @@ import (
 	"github.com/networkservicemesh/sdk/pkg/networkservice/common/null"
 	"github.com/networkservicemesh/sdk/pkg/networkservice/common/retry"
 	"github.com/networkservicemesh/sdk/pkg/networkservice/common/upstreamrefresh"
-	"github.com/networkservicemesh/sdk/pkg/networkservice/connectioncontext/dnscontext"
 	"github.com/networkservicemesh/sdk/pkg/networkservice/core/chain"
-	"github.com/networkservicemesh/sdk/pkg/tools/dnsconfig"
-	"github.com/networkservicemesh/sdk/pkg/tools/dnsutils"
-	"github.com/networkservicemesh/sdk/pkg/tools/dnsutils/cache"
-	"github.com/networkservicemesh/sdk/pkg/tools/dnsutils/checkmsg"
-	"github.com/networkservicemesh/sdk/pkg/tools/dnsutils/dnsconfigs"
-	"github.com/networkservicemesh/sdk/pkg/tools/dnsutils/fanout"
-	"github.com/networkservicemesh/sdk/pkg/tools/dnsutils/next"
-	"github.com/networkservicemesh/sdk/pkg/tools/dnsutils/noloop"
-	"github.com/networkservicemesh/sdk/pkg/tools/dnsutils/searches"
 	"github.com/networkservicemesh/sdk/pkg/tools/grpcutils"
 	"github.com/networkservicemesh/sdk/pkg/tools/log"
 	"github.com/networkservicemesh/sdk/pkg/tools/log/logruslogger"
@@ -86,9 +64,32 @@ import (
 	"github.com/networkservicemesh/sdk/pkg/tools/spiffejwt"
 	"github.com/networkservicemesh/sdk/pkg/tools/token"
 	"github.com/networkservicemesh/sdk/pkg/tools/tracing"
-
-	"github.com/networkservicemesh/cmd-nsc/internal/config"
+	"github.com/sirupsen/logrus"
+	"github.com/spiffe/go-spiffe/v2/spiffetls/tlsconfig"
+	"github.com/spiffe/go-spiffe/v2/svid/x509svid"
+	"github.com/spiffe/go-spiffe/v2/workloadapi"
+	"github.com/vishvananda/netns"
+	"golang.org/x/sys/unix"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
+	v1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
+	"net"
+	"net/url"
+	"os"
+	"os/signal"
+	"runtime"
+	"strings"
+	"syscall"
+	"time"
 )
+
+type server struct {
+	netnspb.UnimplementedNetNSServiceServer
+	clientset *kubernetes.Clientset
+}
 
 func getResolverAddress() (string, error) {
 	if os.Getenv("DNS_RESOLVER_IP") != "" {
@@ -196,8 +197,7 @@ func checkPodNetworkConnectivity(endpoint string) error {
 
 	return err
 }
-
-func main() {
+func handlensmtask() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -227,7 +227,7 @@ func main() {
 		logrus.Fatalf("invalid log level %s", c.LogLevel)
 	}
 	logrus.SetLevel(level)
-
+	c.Name = os.Getenv("POD_NAME")
 	// TODO: Remove this once internalTrafficPolicyi=Local for the nsmgr service works reliably.
 	c.ConnectTo = url.URL{Scheme: "tcp", Host: getNsmgrNodeLocalServiceName() + ".kubeslice-system.svc.cluster.local:5001"}
 	// Resolve connect URL if the connection scheme is tcp or udp
@@ -270,7 +270,13 @@ func main() {
 	// ********************************************************************************
 	// Get a x509Source
 	// ********************************************************************************
+	fmt.Println("*******************************")
+	fmt.Println("Came here")
+	fmt.Println("*******************************")
 	source, err := workloadapi.NewX509Source(ctx)
+	fmt.Println("*******************************")
+	fmt.Println("Came here 2")
+	fmt.Println("*******************************")
 	if err != nil {
 		logger.Fatalf("error getting x509 source: %v", err.Error())
 	}
@@ -302,20 +308,20 @@ func main() {
 	)
 
 	dnsClient := null.NewClient()
-	if c.LocalDNSServerEnabled {
-		dnsConfigsMap := new(dnsconfig.Map)
-		dnsClient = dnscontext.NewClient(dnscontext.WithChainContext(ctx), dnscontext.WithDNSConfigsMap(dnsConfigsMap))
-		dnsServerHandler := next.NewDNSHandler(
-			checkmsg.NewDNSHandler(),
-			dnsconfigs.NewDNSHandler(dnsConfigsMap),
-			searches.NewDNSHandler(),
-			noloop.NewDNSHandler(),
-			cache.NewDNSHandler(),
-			fanout.NewDNSHandler(),
-		)
-
-		go dnsutils.ListenAndServe(ctx, dnsServerHandler, c.LocalDNSServerAddress)
-	}
+	//if c.LocalDNSServerEnabled {
+	//	dnsConfigsMap := new(dnsconfig.Map)
+	//	dnsClient = dnscontext.NewClient(dnscontext.WithChainContext(ctx), dnscontext.WithDNSConfigsMap(dnsConfigsMap))
+	//	dnsServerHandler := next.NewDNSHandler(
+	//		checkmsg.NewDNSHandler(),
+	//		dnsconfigs.NewDNSHandler(dnsConfigsMap),
+	//		searches.NewDNSHandler(),
+	//		noloop.NewDNSHandler(),
+	//		cache.NewDNSHandler(),
+	//		fanout.NewDNSHandler(),
+	//	)
+	//
+	//	go dnsutils.ListenAndServe(ctx, dnsServerHandler, c.LocalDNSServerAddress)
+	//}
 
 	var healOptions = []heal.Option{heal.WithLivenessCheckInterval(c.LivenessCheckInterval),
 		heal.WithLivenessCheckTimeout(c.LivenessCheckTimeout)}
@@ -323,7 +329,8 @@ func main() {
 	if c.LivenessCheckEnabled {
 		healOptions = append(healOptions, heal.WithLivenessCheck(kernelheal.KernelLivenessCheck))
 	}
-
+	tmpkernel := kernel.NewClient()
+	fmt.Println("printing kernel interface: ", tmpkernel)
 	nsmClient := client.NewClient(ctx,
 		client.WithClientURL(&c.ConnectTo),
 		client.WithName(c.Name),
@@ -344,7 +351,6 @@ func main() {
 		client.WithDialTimeout(c.DialTimeout),
 		client.WithDialOptions(dialOptions...),
 	)
-
 	nsmClient = retry.NewClient(nsmClient, retry.WithTryTimeout(c.RequestTimeout), retry.WithInterval(5*time.Second))
 
 	// ********************************************************************************
@@ -443,4 +449,153 @@ func main() {
 
 	// Wait for cancel event to terminate
 	<-signalCtx.Done()
+}
+func main() {
+	config, err := rest.InClusterConfig()
+	Logger := log.FromContext(context.Background())
+	if err != nil {
+		Logger.Fatalf("failed loading config: %v", err.Error())
+	}
+	clientset, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		Logger.Fatalf("failed creating clientset: %v", err.Error())
+	}
+	lis, err := net.Listen("tcp", ":50052")
+	if err != nil {
+		Logger.Fatalf("failed to listen: %v", err.Error())
+	}
+	grpcServer := grpc.NewServer()
+	netnspb.RegisterNetNSServiceServer(grpcServer, &server{clientset: clientset})
+	fmt.Println("starting server at 50051")
+	if err := grpcServer.Serve(lis); err != nil {
+		Logger.Fatalf("failed to serve: %v", err.Error())
+	}
+}
+
+func (s *server) ProcessPod(ctx context.Context, req *netnspb.PodRequest) (*netnspb.PodResponse, error) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	namespace := req.GetNamespace()
+	podName := req.GetName()
+	err := os.Setenv("POD_NAME", podName)
+	if err != nil {
+		return nil, err
+	}
+	_ = os.Setenv("NSM_NAME", podName)
+	fmt.Println("Processing pod:", podName, namespace)
+
+	pod, err := s.clientset.CoreV1().Pods(namespace).Get(context.Background(), podName, metav1.GetOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to get pod: %v", err)
+	}
+	var pid uint32
+	for i := 0; i < 5; i++ {
+		pid, err = GetPodPID(pod, s.clientset)
+		if err == nil {
+			fmt.Printf("Got PID: %d\n", pid)
+			break
+		}
+		fmt.Printf("Attempt %d: %v\n", i+1, err)
+		time.Sleep(5 * time.Second)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to get pod PID: %v", err)
+	}
+
+	//origNS, err := netns.Get()
+	//if err != nil {
+	//	return nil, fmt.Errorf("failed to get current netns: %v", err)
+	//}
+	//defer origNS.Close()
+
+	podNS, err := netns.GetFromPid(int(pid))
+	if err != nil {
+		return nil, fmt.Errorf("failed to get pod netns: %v", err)
+	}
+	//defer podNS.Close()
+	if err := netns.Set(podNS); err != nil {
+		return nil, fmt.Errorf("failed to set netns: %v", err)
+	}
+	origNS, err := netns.Get()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get current netns: %v", err)
+	}
+	//defer origNS.Close()
+	//defer netns.Set(origNS)
+	fmt.Println("New pod NS: ", podNS)
+	// Your actual pod processing logic
+	fmt.Println("Handling actual work for pod", podName)
+	same, err := compareNS(origNS, podNS)
+	if err != nil {
+		return nil, fmt.Errorf("failed to compare netns: %v", err)
+	}
+	if same {
+		handlensmtask()
+	} else {
+		fmt.Println("Ns not match")
+	}
+	fmt.Println("work done")
+	return &netnspb.PodResponse{Status: "Pod processed successfully"}, nil
+}
+func compareNS(ns1, ns2 netns.NsHandle) (bool, error) {
+	var stat1, stat2 unix.Stat_t
+	if err := unix.Fstat(int(ns1), &stat1); err != nil {
+		return false, err
+	}
+	if err := unix.Fstat(int(ns2), &stat2); err != nil {
+		return false, err
+	}
+	return (stat1.Ino == stat2.Ino && stat1.Dev == stat2.Dev), nil
+}
+func GetPodPID(pod *v1.Pod, clientset *kubernetes.Clientset) (uint32, error) {
+	if len(pod.Status.ContainerStatuses) == 0 {
+		return 0, fmt.Errorf("no containers in pod")
+	}
+
+	// Poll until container is running
+	for i := 0; i < 30; i++ { // wait up to ~30s
+		if pod.Status.ContainerStatuses[0].Ready &&
+			pod.Status.ContainerStatuses[0].State.Running != nil {
+			break
+		}
+		time.Sleep(1 * time.Second)
+
+		// refresh Pod status
+		refreshed, err := clientset.CoreV1().Pods(pod.Namespace).Get(
+			context.Background(),
+			pod.Name,
+			metav1.GetOptions{},
+		)
+		if err != nil {
+			return 0, err
+		}
+		pod = refreshed
+	}
+
+	containerID := pod.Status.ContainerStatuses[0].ContainerID
+	parts := strings.Split(containerID, "://")
+	if len(parts) != 2 {
+		return 0, fmt.Errorf("invalid containerID format: %s", containerID)
+	}
+	cid := parts[1]
+
+	client, err := containerd.New("/run/k3s/containerd/containerd.sock")
+	if err != nil {
+		return 0, err
+	}
+	defer client.Close()
+
+	ctx := namespaces.WithNamespace(context.Background(), "k8s.io")
+	container, err := client.LoadContainer(ctx, cid)
+	if err != nil {
+		return 0, err
+	}
+
+	task, err := container.Task(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+
+	return task.Pid(), nil
 }

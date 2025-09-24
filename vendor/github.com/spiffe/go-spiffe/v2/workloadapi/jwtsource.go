@@ -16,6 +16,7 @@ var jwtsourceErr = errs.Class("jwtsource")
 // Workload API.
 type JWTSource struct {
 	watcher *watcher
+	picker  func([]*jwtsvid.SVID) *jwtsvid.SVID
 
 	mtx     sync.RWMutex
 	bundles *jwtbundle.Set
@@ -25,14 +26,17 @@ type JWTSource struct {
 }
 
 // NewJWTSource creates a new JWTSource. It blocks until the initial update
-// has been received from the Workload API.
+// has been received from the Workload API. The source should be closed when
+// no longer in use to free underlying resources.
 func NewJWTSource(ctx context.Context, options ...JWTSourceOption) (_ *JWTSource, err error) {
 	config := &jwtSourceConfig{}
 	for _, option := range options {
 		option.configureJWTSource(config)
 	}
 
-	s := &JWTSource{}
+	s := &JWTSource{
+		picker: config.picker,
+	}
 
 	s.watcher, err = newWatcher(ctx, config.watcher, nil, s.setJWTBundles)
 	if err != nil {
@@ -60,7 +64,31 @@ func (s *JWTSource) FetchJWTSVID(ctx context.Context, params jwtsvid.Params) (*j
 	if err := s.checkClosed(); err != nil {
 		return nil, err
 	}
-	return s.watcher.client.FetchJWTSVID(ctx, params)
+
+	var (
+		svid *jwtsvid.SVID
+		err  error
+	)
+	if s.picker == nil {
+		svid, err = s.watcher.client.FetchJWTSVID(ctx, params)
+	} else {
+		svids, err := s.watcher.client.FetchJWTSVIDs(ctx, params)
+		if err != nil {
+			return svid, err
+		}
+		svid = s.picker(svids)
+	}
+
+	return svid, err
+}
+
+// FetchJWTSVIDs fetches all JWT-SVIDs from the source with the given parameters.
+// It implements the jwtsvid.Source interface.
+func (s *JWTSource) FetchJWTSVIDs(ctx context.Context, params jwtsvid.Params) ([]*jwtsvid.SVID, error) {
+	if err := s.checkClosed(); err != nil {
+		return nil, err
+	}
+	return s.watcher.client.FetchJWTSVIDs(ctx, params)
 }
 
 // GetJWTBundleForTrustDomain returns the JWT bundle for the given trust

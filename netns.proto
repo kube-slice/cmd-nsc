@@ -1,0 +1,17 @@
+syntax = "proto3";
+
+package netns;
+option go_package = "pkg/netns;netns";
+service NetNSService {
+  // Receives pod name and namespace
+  rpc ProcessPod(PodRequest) returns (PodResponse) {}
+}
+
+message PodRequest {
+  string Name = 1;
+  string Namespace = 2;
+}
+
+message PodResponse {
+  string Status = 1;
+}
