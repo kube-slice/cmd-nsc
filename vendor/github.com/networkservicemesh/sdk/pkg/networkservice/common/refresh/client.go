@@ -80,8 +80,7 @@ func (t *refreshClient) Request(ctx context.Context, request *networkservice.Net
 				return
 			case <-afterTicker.C():
 				if err := <-eventFactory.Request(begin.CancelContext(cancelCtx)); err != nil {
-					logger.Warnf("refresh failed: %s.. will retry", err.Error())
-					afterTicker.Reset(10 * time.Second)
+					logger.Warnf("refresh failed: %s", err.Error())
 					continue
 				}
 				return
@@ -134,7 +133,7 @@ func after(ctx context.Context, conn *networkservice.Connection) time.Duration {
 	scale := 1. / 3.
 	path := conn.GetPath()
 	if len(path.PathSegments) > 1 {
-		scale = 0.4 + 0.4*float64(path.Index)/float64(len(path.PathSegments))
+                scale = 0.4 + 0.4*float64(path.Index)/float64(len(path.PathSegments))
 	}
 	duration := time.Duration(float64(*minTimeout) * scale)
 

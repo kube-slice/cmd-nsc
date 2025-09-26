@@ -1,4 +1,4 @@
-// Copyright (c) 2021 Cisco and/or its affiliates.
+// Copyright (c) 2021-2022 Cisco and/or its affiliates.
 //
 // SPDX-License-Identifier: Apache-2.0
 //
@@ -55,12 +55,13 @@ func (b *beginServer) Request(ctx context.Context, request *networkservice.Netwo
 		),
 	)
 	<-eventFactoryServer.executor.AsyncExec(func() {
-		currentEventFactoryServer, _ := b.LoadOrStore(request.GetConnection().GetId(), eventFactoryServer)
+		currentEventFactoryServer, _ := b.Load(request.GetConnection().GetId())
 		if currentEventFactoryServer != eventFactoryServer {
 			log.FromContext(ctx).Debug("recalling begin.Request because currentEventFactoryServer != eventFactoryServer")
 			conn, err = b.Request(ctx, request)
 			return
 		}
+
 		ctx = withEventFactory(ctx, eventFactoryServer)
 		conn, err = next.Server(ctx).Request(ctx, request)
 		if err != nil {
@@ -75,6 +76,7 @@ func (b *beginServer) Request(ctx context.Context, request *networkservice.Netwo
 		eventFactoryServer.state = established
 
 		eventFactoryServer.returnedConnection = conn.Clone()
+		eventFactoryServer.updateContext(ctx)
 	})
 	return conn, err
 }
@@ -93,7 +95,7 @@ func (b *beginServer) Close(ctx context.Context, conn *networkservice.Connection
 		if eventFactoryServer.state != established || eventFactoryServer.request == nil {
 			return
 		}
-		currentServerClient, _ := b.LoadOrStore(conn.GetId(), eventFactoryServer)
+		currentServerClient, _ := b.Load(conn.GetId())
 		if currentServerClient != eventFactoryServer {
 			return
 		}

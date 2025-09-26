@@ -27,6 +27,7 @@ import (
 	"github.com/networkservicemesh/api/pkg/api/networkservice"
 	"github.com/networkservicemesh/api/pkg/api/networkservice/mechanisms/common"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/peer"
 
 	"github.com/networkservicemesh/sdk/pkg/networkservice/core/next"
 )
@@ -46,9 +47,14 @@ func (s *sendFDClient) Request(ctx context.Context, request *networkservice.Netw
 
 	// Iterate over mechanisms
 	inodeURLToFileURLMap := make(map[string]string)
-	for _, mechanism := range append(request.GetMechanismPreferences(), request.GetConnection().GetMechanism()) {
-		if err := sendFDAndSwapFileToInode(sender, mechanism.GetParameters(), inodeURLToFileURLMap); err != nil {
-			return nil, err
+	p, ok := peer.FromContext(ctx)
+        if ok {
+		if p.Addr.Network() == "unix" {
+	                for _, mechanism := range append(request.GetMechanismPreferences(), request.GetConnection().GetMechanism()) {
+		                if err := sendFDAndSwapFileToInode(sender, mechanism.GetParameters(), inodeURLToFileURLMap); err != nil {
+			                return nil, err
+		                }
+	                }
 		}
 	}
 	// Call the next Client in the chain

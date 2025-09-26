@@ -59,7 +59,7 @@ func (b *beginClient) Request(ctx context.Context, request *networkservice.Netwo
 	<-eventFactoryClient.executor.AsyncExec(func() {
 		// If the eventFactory has changed, usually because the connection has been Closed and re-established
 		// go back to the beginning and try again.
-		currentEventFactoryClient, _ := b.LoadOrStore(request.GetConnection().GetId(), eventFactoryClient)
+		currentEventFactoryClient, _ := b.Load(request.GetConnection().GetId())
 		if currentEventFactoryClient != eventFactoryClient {
 			log.FromContext(ctx).Debug("recalling begin.Request because currentEventFactoryClient != eventFactoryClient")
 			conn, err = b.Request(ctx, request, opts...)
@@ -82,6 +82,7 @@ func (b *beginClient) Request(ctx context.Context, request *networkservice.Netwo
 		eventFactoryClient.state = established
 
 		eventFactoryClient.returnedConnection = conn.Clone()
+		eventFactoryClient.updateContext(ctx)
 	})
 	return conn, err
 }
@@ -103,7 +104,7 @@ func (b *beginClient) Close(ctx context.Context, conn *networkservice.Connection
 		}
 
 		// If this isn't the connection we started with, do nothing
-		currentEventFactoryClient, _ := b.LoadOrStore(conn.GetId(), eventFactoryClient)
+		currentEventFactoryClient, _ := b.Load(conn.GetId())
 		if currentEventFactoryClient != eventFactoryClient {
 			return
 		}

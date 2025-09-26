@@ -27,10 +27,10 @@ import (
 	"bufio"
 	"context"
 	"crypto/md5"
-	"crypto/tls"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"google.golang.org/grpc/credentials/insecure"
 	"net"
 	"net/url"
 	"os"
@@ -42,18 +42,14 @@ import (
 	nested "github.com/antonfisher/nested-logrus-formatter"
 	"github.com/edwarnicke/grpcfd"
 	"github.com/kelseyhightower/envconfig"
-	"github.com/sirupsen/logrus"
-	"github.com/spiffe/go-spiffe/v2/spiffetls/tlsconfig"
-	"github.com/spiffe/go-spiffe/v2/svid/x509svid"
-	"github.com/spiffe/go-spiffe/v2/workloadapi"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials"
-
 	kernelheal "github.com/networkservicemesh/sdk-kernel/pkg/kernel/tools/heal"
+	"github.com/sirupsen/logrus"
+	"google.golang.org/grpc"
 
 	"github.com/networkservicemesh/api/pkg/api/networkservice"
 	kernelmech "github.com/networkservicemesh/api/pkg/api/networkservice/mechanisms/kernel"
 	vfiomech "github.com/networkservicemesh/api/pkg/api/networkservice/mechanisms/vfio"
+	"github.com/networkservicemesh/cmd-nsc/internal/config"
 	"github.com/networkservicemesh/sdk-sriov/pkg/networkservice/common/mechanisms/vfio"
 	sriovtoken "github.com/networkservicemesh/sdk-sriov/pkg/networkservice/common/token"
 	"github.com/networkservicemesh/sdk/pkg/networkservice/chains/client"
@@ -83,11 +79,7 @@ import (
 	"github.com/networkservicemesh/sdk/pkg/tools/log/logruslogger"
 	"github.com/networkservicemesh/sdk/pkg/tools/nsurl"
 	"github.com/networkservicemesh/sdk/pkg/tools/opentelemetry"
-	"github.com/networkservicemesh/sdk/pkg/tools/spiffejwt"
-	"github.com/networkservicemesh/sdk/pkg/tools/token"
 	"github.com/networkservicemesh/sdk/pkg/tools/tracing"
-
-	"github.com/networkservicemesh/cmd-nsc/internal/config"
 )
 
 func getResolverAddress() (string, error) {
@@ -270,19 +262,6 @@ func main() {
 	// ********************************************************************************
 	// Get a x509Source
 	// ********************************************************************************
-	source, err := workloadapi.NewX509Source(ctx)
-	if err != nil {
-		logger.Fatalf("error getting x509 source: %v", err.Error())
-	}
-	var svid *x509svid.SVID
-	svid, err = source.GetX509SVID()
-	if err != nil {
-		logger.Fatalf("error getting x509 svid: %v", err.Error())
-	}
-	logger.Infof("sVID: %q", svid.ID)
-
-	tlsClientConfig := tlsconfig.MTLSClientConfig(source, source, tlsconfig.AuthorizeAny())
-	tlsClientConfig.MinVersion = tls.VersionTLS12
 
 	// ********************************************************************************
 	// Create Network Service Manager nsmClient
@@ -292,11 +271,10 @@ func main() {
 		grpcfd.WithChainUnaryInterceptor(),
 		grpc.WithDefaultCallOptions(
 			grpc.WaitForReady(true),
-			grpc.PerRPCCredentials(token.NewPerRPCCredentials(spiffejwt.TokenGeneratorFunc(source, c.MaxTokenLifetime))),
 		),
 		grpc.WithTransportCredentials(
 			grpcfd.TransportCredentials(
-				credentials.NewTLS(tlsClientConfig),
+				insecure.NewCredentials(),
 			),
 		),
 	)

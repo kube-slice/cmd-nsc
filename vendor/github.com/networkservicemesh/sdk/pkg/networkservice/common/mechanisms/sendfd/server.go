@@ -26,6 +26,8 @@ import (
 	"github.com/golang/protobuf/ptypes/empty"
 	"github.com/networkservicemesh/api/pkg/api/networkservice"
 
+	"google.golang.org/grpc/peer"
+
 	"github.com/networkservicemesh/sdk/pkg/networkservice/core/next"
 )
 
@@ -41,6 +43,15 @@ func (s sendFDServer) Request(ctx context.Context, request *networkservice.Netwo
 	conn, err := next.Server(ctx).Request(ctx, request)
 	if err != nil {
 		return nil, err
+	}
+
+	p, ok := peer.FromContext(ctx)
+	if !ok {
+		return conn, nil
+	}
+
+	if p.Addr.Network() != "unix" {
+		return conn, nil
 	}
 
 	// Get the grpcfd.FDSender

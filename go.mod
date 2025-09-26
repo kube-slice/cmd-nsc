@@ -6,7 +6,7 @@ require (
 	github.com/antonfisher/nested-logrus-formatter v1.3.1
 	github.com/edwarnicke/grpcfd v1.1.2
 	github.com/kelseyhightower/envconfig v1.4.0
-	github.com/networkservicemesh/api v1.5.0
+	github.com/networkservicemesh/api v1.6.1
 	github.com/networkservicemesh/sdk v1.5.0
 	github.com/networkservicemesh/sdk-kernel v1.5.0
 	github.com/networkservicemesh/sdk-sriov v1.5.0
@@ -16,8 +16,6 @@ require (
 	github.com/stretchr/testify v1.8.4
 	google.golang.org/grpc v1.59.0
 )
-
-replace github.com/networkservicemesh/sdk v1.5.0 => github.com/kubeslice/nsm-sdk v1.5.5-kbs-nsm-sidecar
 
 require (
 	cloud.google.com/go/compute/metadata v0.2.3 // indirect
@@ -38,7 +36,7 @@ require (
 	github.com/google/shlex v0.0.0-20191202100458-e7afc7fbc510 // indirect
 	github.com/google/uuid v1.3.1 // indirect
 	github.com/grpc-ecosystem/grpc-gateway/v2 v2.16.0 // indirect
-	github.com/miekg/dns v1.1.49 // indirect
+	github.com/miekg/dns v1.1.50 // indirect
 	github.com/open-policy-agent/opa v0.44.0 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
 	github.com/rcrowley/go-metrics v0.0.0-20201227073835-cf1acfcdf475 // indirect
@@ -70,3 +68,5 @@ require (
 	gopkg.in/yaml.v2 v2.4.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
+
+replace github.com/networkservicemesh/sdk => github.com/kube-slice/nsm-sdk v1.6.2-kbs-vl3.0.20250926050737-a7ae382978a6
