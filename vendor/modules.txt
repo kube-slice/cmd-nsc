@@ -88,7 +88,7 @@ github.com/networkservicemesh/api/pkg/api/networkservice/mechanisms/common
 github.com/networkservicemesh/api/pkg/api/networkservice/mechanisms/kernel
 github.com/networkservicemesh/api/pkg/api/networkservice/mechanisms/vfio
 github.com/networkservicemesh/api/pkg/api/registry
-# github.com/networkservicemesh/sdk v1.5.0 => github.com/kube-slice/nsm-sdk v1.6.2-kbs-vl3.0.20250926050737-a7ae382978a6
+# github.com/networkservicemesh/sdk v1.5.0 => github.com/kube-slice/nsm-sdk v1.5.5-kbs-nsm-sidecar.0.20250930092016-7f221b7d57a5
 ## explicit; go 1.18
 github.com/networkservicemesh/sdk/pkg/networkservice/chains/client
 github.com/networkservicemesh/sdk/pkg/networkservice/common/authorize
@@ -141,7 +141,6 @@ github.com/networkservicemesh/sdk/pkg/tools/opentelemetry
 github.com/networkservicemesh/sdk/pkg/tools/postpone
 github.com/networkservicemesh/sdk/pkg/tools/spiffejwt
 github.com/networkservicemesh/sdk/pkg/tools/spire
-github.com/networkservicemesh/sdk/pkg/tools/stringset
 github.com/networkservicemesh/sdk/pkg/tools/token
 github.com/networkservicemesh/sdk/pkg/tools/tracing
 github.com/networkservicemesh/sdk/pkg/tools/typeutils
@@ -507,4 +506,3 @@ gopkg.in/yaml.v2
 # gopkg.in/yaml.v3 v3.0.1
 ## explicit
 gopkg.in/yaml.v3
-# github.com/networkservicemesh/sdk => github.com/kube-slice/nsm-sdk v1.6.2-kbs-vl3.0.20250926050737-a7ae382978a6

@@ -29,7 +29,7 @@ import (
 )
 
 const (
-	timeout = 5 * time.Second
+	timeout = 3 * time.Second
 )
 
 type searchDomainsHandler struct {
@@ -47,21 +47,33 @@ func (h *searchDomainsHandler) ServeDNS(ctx context.Context, rw dns.ResponseWrit
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	next.Handler(ctx).ServeDNS(ctx, r, m)
-
-	for _, d := range SearchDomains(ctx) {
+	for i, d := range append([]string{""}, SearchDomains(ctx)...) {
 		newMsg := m.Copy()
 		newMsg.Question[0].Name = dns.Fqdn(newMsg.Question[0].Name + d)
 		next.Handler(ctx).ServeDNS(ctx, r, newMsg)
+
+		// If the response contains an answer section, return right away.
+		if r.Responses[i] != nil && r.Responses[i].Rcode == dns.RcodeSuccess && len(r.Responses[i].Answer) > 0 {
+			log.FromContext(ctx).WithField("searchDomainsHandler", "ServeDNS").Debugf("Returning response with ans section: %v", r.Responses[i])
+			r.Responses[i].Question = m.Question
+			if err := rw.WriteMsg(r.Responses[i]); err != nil {
+				log.FromContext(ctx).WithField("searchDomainsHandler", "ServeDNS").Warnf("got an error during write the message: %v", err.Error())
+				dns.HandleFailed(rw, r.Responses[i])
+				return
+			}
+			return
+		}
 	}
 
-	for _, resp := range r.Responses {
+	// If we are here, we have received responses without an answer section. Return the first response with an Rcode of success.
+	// If there are no responses with RcodeSuccess, we fallthrough and return a failure message to the caller.
+	for i, resp := range r.Responses {
 		if resp != nil && resp.Rcode == dns.RcodeSuccess {
-			resp.Question = m.Question
-			if err := rw.WriteMsg(resp); err != nil {
+			log.FromContext(ctx).WithField("searchDomainsHandler", "ServeDNS").Debugf("Returning response without ans: %v", r.Responses[i])
+			r.Responses[i].Question = m.Question
+			if err := rw.WriteMsg(r.Responses[i]); err != nil {
 				log.FromContext(ctx).WithField("searchDomainsHandler", "ServeDNS").Warnf("got an error during write the message: %v", err.Error())
-				dns.HandleFailed(rw, resp)
-				return
+				dns.HandleFailed(rw, r.Responses[i])
 			}
 			return
 		}

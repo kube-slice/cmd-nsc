@@ -18,7 +18,7 @@ package opa
 
 import (
 	"context"
-	"os"
+	"io/ioutil"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -152,7 +152,7 @@ func (d *AuthorizationPolicy) loadSource() error {
 		return nil
 	}
 	var b []byte
-	b, err := os.ReadFile(d.policyFilePath)
+	b, err := ioutil.ReadFile(d.policyFilePath)
 	if err != nil {
 		return err
 	}

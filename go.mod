@@ -69,4 +69,4 @@ require (
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
 
-replace github.com/networkservicemesh/sdk => github.com/kube-slice/nsm-sdk v1.6.2-kbs-vl3.0.20250926050737-a7ae382978a6
+replace github.com/networkservicemesh/sdk v1.5.0 => github.com/kube-slice/nsm-sdk v1.5.5-kbs-nsm-sidecar.0.20250930092016-7f221b7d57a5

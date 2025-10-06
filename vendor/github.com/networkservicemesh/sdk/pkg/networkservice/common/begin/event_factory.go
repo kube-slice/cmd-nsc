@@ -1,4 +1,4 @@
-// Copyright (c) 2021-2022 Cisco and/or its affiliates.
+// Copyright (c) 2021 Cisco and/or its affiliates.
 //
 // SPDX-License-Identifier: Apache-2.0
 //
@@ -60,7 +60,11 @@ func newEventFactoryClient(ctx context.Context, afterClose func(), opts ...grpc.
 		client: next.Client(ctx),
 		opts:   opts,
 	}
-	f.updateContext(ctx)
+	ctxFunc := postpone.Context(ctx)
+	f.ctxFunc = func() (context.Context, context.CancelFunc) {
+		eventCtx, cancel := ctxFunc()
+		return withEventFactory(eventCtx, f), cancel
+	}
 
 	f.afterCloseFunc = func() {
 		f.state = closed
@@ -69,14 +73,6 @@ func newEventFactoryClient(ctx context.Context, afterClose func(), opts ...grpc.
 		}
 	}
 	return f
-}
-
-func (f *eventFactoryClient) updateContext(ctx context.Context) {
-	ctxFunc := postpone.ContextWithValues(ctx)
-	f.ctxFunc = func() (context.Context, context.CancelFunc) {
-		eventCtx, cancel := ctxFunc()
-		return withEventFactory(eventCtx, f), cancel
-	}
 }
 
 func (f *eventFactoryClient) Request(opts ...Option) <-chan error {
@@ -159,21 +155,17 @@ func newEventFactoryServer(ctx context.Context, afterClose func()) *eventFactory
 	f := &eventFactoryServer{
 		server: next.Server(ctx),
 	}
-	f.updateContext(ctx)
+	ctxFunc := postpone.Context(ctx)
+	f.ctxFunc = func() (context.Context, context.CancelFunc) {
+		eventCtx, cancel := ctxFunc()
+		return withEventFactory(eventCtx, f), cancel
+	}
 
 	f.afterCloseFunc = func() {
 		f.state = closed
 		afterClose()
 	}
 	return f
-}
-
-func (f *eventFactoryServer) updateContext(ctx context.Context) {
-	ctxFunc := postpone.ContextWithValues(ctx)
-	f.ctxFunc = func() (context.Context, context.CancelFunc) {
-		eventCtx, cancel := ctxFunc()
-		return withEventFactory(eventCtx, f), cancel
-	}
 }
 
 func (f *eventFactoryServer) Request(opts ...Option) <-chan error {

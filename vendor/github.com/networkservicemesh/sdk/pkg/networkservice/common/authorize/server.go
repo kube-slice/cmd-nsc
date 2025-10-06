@@ -30,7 +30,6 @@ import (
 	"github.com/networkservicemesh/sdk/pkg/networkservice/core/next"
 	"github.com/networkservicemesh/sdk/pkg/tools/opa"
 	"github.com/networkservicemesh/sdk/pkg/tools/spire"
-	"github.com/networkservicemesh/sdk/pkg/tools/stringset"
 )
 
 type authorizeServer struct {
@@ -77,7 +76,7 @@ func (a *authorizeServer) Request(ctx context.Context, request *networkservice.N
 		connID := conn.GetPath().GetPathSegments()[index-1].GetId()
 		ids, ok := a.spiffeIDConnectionMap.Load(spiffeID)
 		if !ok {
-			ids = new(stringset.StringSet)
+			ids = &spire.ConnectionIDSet{}
 		}
 		ids.Store(connID, struct{}{})
 		a.spiffeIDConnectionMap.Store(spiffeID, ids)
@@ -87,10 +86,6 @@ func (a *authorizeServer) Request(ctx context.Context, request *networkservice.N
 
 func (a *authorizeServer) Close(ctx context.Context, conn *networkservice.Connection) (*empty.Empty, error) {
 	var index = conn.GetPath().GetIndex()
-	var leftSide = &networkservice.Path{
-		Index:        index,
-		PathSegments: conn.GetPath().GetPathSegments()[:index+1],
-	}
 	if spiffeID, err := spire.SpiffeIDFromContext(ctx); err == nil {
 		connID := conn.GetPath().GetPathSegments()[index-1].GetId()
 		ids, ok := a.spiffeIDConnectionMap.Load(spiffeID)
@@ -108,11 +103,6 @@ func (a *authorizeServer) Close(ctx context.Context, conn *networkservice.Connec
 			a.spiffeIDConnectionMap.Delete(spiffeID)
 		} else {
 			a.spiffeIDConnectionMap.Store(spiffeID, ids)
-		}
-	}
-	if _, ok := peer.FromContext(ctx); ok {
-		if err := a.policies.check(ctx, leftSide); err != nil {
-			return nil, err
 		}
 	}
 	return next.Server(ctx).Close(ctx, conn)

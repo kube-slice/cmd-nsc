@@ -14,13 +14,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package stringset
+package spire
 
 import (
 	"sync"
 )
 
-//go:generate go-syncmap -output sync_map.gen.go -type StringSet<string,struct{}>
+//go:generate go-syncmap -output connection_id_set.gen.go -type ConnectionIDSet<string,struct{}>
 
-// StringSet - sync.Map with key == string and value == struct{}
-type StringSet sync.Map
+// ConnectionIDSet - sync.Map with key == string and value == bool
+type ConnectionIDSet sync.Map

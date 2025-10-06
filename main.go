@@ -30,6 +30,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"github.com/networkservicemesh/sdk/pkg/networkservice/common/updatepath"
 	"google.golang.org/grpc/credentials/insecure"
 	"net"
 	"net/url"
@@ -53,7 +54,6 @@ import (
 	"github.com/networkservicemesh/sdk-sriov/pkg/networkservice/common/mechanisms/vfio"
 	sriovtoken "github.com/networkservicemesh/sdk-sriov/pkg/networkservice/common/token"
 	"github.com/networkservicemesh/sdk/pkg/networkservice/chains/client"
-	"github.com/networkservicemesh/sdk/pkg/networkservice/common/authorize"
 	"github.com/networkservicemesh/sdk/pkg/networkservice/common/clientinfo"
 	"github.com/networkservicemesh/sdk/pkg/networkservice/common/excludedprefixes"
 	"github.com/networkservicemesh/sdk/pkg/networkservice/common/heal"
@@ -305,9 +305,10 @@ func main() {
 	nsmClient := client.NewClient(ctx,
 		client.WithClientURL(&c.ConnectTo),
 		client.WithName(c.Name),
-		client.WithAuthorizeClient(authorize.NewClient()),
+		//client.WithAuthorizeClient(authorize.NewClient(authorize.Any())),
 		client.WithHealClient(heal.NewClient(ctx, healOptions...)),
 		client.WithAdditionalFunctionality(
+			updatepath.NewClient(c.Name),
 			clientinfo.NewClient(),
 			upstreamrefresh.NewClient(ctx),
 			sriovtoken.NewClient(),
@@ -319,7 +320,7 @@ func main() {
 			dnsClient,
 			excludedprefixes.NewClient(excludedprefixes.WithAwarenessGroups(c.AwarenessGroups)),
 		),
-		client.WithDialTimeout(c.DialTimeout),
+		client.WithDialTimeout(30*time.Second),
 		client.WithDialOptions(dialOptions...),
 	)
 
@@ -358,7 +359,9 @@ func main() {
 	for i := 0; i < len(c.NetworkServices); i++ {
 		// Update network services configs
 		u := (*nsurl.NSURL)(&c.NetworkServices[i])
-
+		fmt.Println("****************************************")
+		fmt.Println(strings.ToUpper(u.Scheme))
+		fmt.Println("****************************************")
 		id := fmt.Sprintf("%s-%d", c.Name, i)
 		var monitoredConnections map[string]*networkservice.Connection
 		monitorCtx, cancelMonitor := context.WithTimeout(signalCtx, c.RequestTimeout)

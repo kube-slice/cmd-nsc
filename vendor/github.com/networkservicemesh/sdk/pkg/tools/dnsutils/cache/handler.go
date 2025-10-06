@@ -42,6 +42,7 @@ func (h *dnsCacheHandler) ServeDNS(ctx context.Context, rw dns.ResponseWriter, m
 		v := val.Copy()
 		if validateMsg(v) {
 			v.Id = m.Id
+			log.FromContext(ctx).WithField("dnsCacheHandler", "ServeDNS").Debugf("returning from cache: %v, ans: %v", v, v.Answer)
 			if err := rw.WriteMsg(v); err != nil {
 				log.FromContext(ctx).WithField("dnsCacheHandler", "ServeDNS").Warnf("got an error during write the message: %v", err.Error())
 				dns.HandleFailed(rw, v)
@@ -85,9 +86,6 @@ func (h *dnsCacheHandler) updateTTL() {
 }
 
 func validateMsg(m *dns.Msg) bool {
-	if len(m.Answer) == 0 {
-		return false
-	}
 	for _, answer := range m.Answer {
 		if answer.Header().Ttl <= 0 {
 			return false

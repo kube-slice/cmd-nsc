@@ -18,7 +18,6 @@ package connect
 
 import (
 	"context"
-	"fmt"
 
 	"github.com/golang/protobuf/ptypes/empty"
 	"github.com/pkg/errors"
@@ -52,10 +51,8 @@ func (c *connectServer) Request(ctx context.Context, request *networkservice.Net
 		return nil, clientErr
 	}
 	request.Connection = clientConn
-	fmt.Println("here")
 	serverConn, serverErr := next.Server(ctx).Request(ctx, request)
 	if serverErr != nil {
-		fmt.Println("closed")
 		closeCtx, closeCancel := closeCtxFunc()
 		defer closeCancel()
 		_, _ = c.client.Close(closeCtx, clientConn, c.callOptions...)

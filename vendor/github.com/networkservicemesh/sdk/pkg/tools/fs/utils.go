@@ -1,7 +1,5 @@
 // Copyright (c) 2020-2021 Doc.ai and/or its affiliates.
 //
-// Copyright (c) 2022 Cisco and/or its affiliates.
-//
 // SPDX-License-Identifier: Apache-2.0
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -20,6 +18,7 @@ package fs
 
 import (
 	"context"
+	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strings"
@@ -78,7 +77,7 @@ func WatchFile(ctx context.Context, filePath string) <-chan []byte {
 func monitorFile(ctx context.Context, filePath string, watcher *fsnotify.Watcher, notifyCh chan<- []byte) {
 	logger := log.FromContext(ctx).WithField("fs.monitorFile", filePath)
 
-	bytes, _ := os.ReadFile(filepath.Clean(filePath))
+	bytes, _ := ioutil.ReadFile(filepath.Clean(filePath))
 	if !sendOrClose(ctx, notifyCh, bytes) {
 		return
 	}
@@ -101,11 +100,11 @@ func monitorFile(ctx context.Context, filePath string, watcher *fsnotify.Watcher
 			} else if e.Op&(fsnotify.Write|fsnotify.Create) == 0 {
 				continue
 			}
-			data, err := os.ReadFile(filepath.Clean(filePath))
+			data, err := ioutil.ReadFile(filepath.Clean(filePath))
 			for err != nil && ctx.Err() == nil {
 				time.Sleep(time.Millisecond * 50)
 				logger.Warn(err.Error())
-				data, err = os.ReadFile(filepath.Clean(filePath))
+				data, err = ioutil.ReadFile(filepath.Clean(filePath))
 			}
 			if !sendOrClose(ctx, notifyCh, data) {
 				return
