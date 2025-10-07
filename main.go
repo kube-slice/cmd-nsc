@@ -30,7 +30,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"github.com/networkservicemesh/sdk/pkg/networkservice/common/updatepath"
 	"google.golang.org/grpc/credentials/insecure"
 	"net"
 	"net/url"
@@ -308,7 +307,7 @@ func main() {
 		//client.WithAuthorizeClient(authorize.NewClient(authorize.Any())),
 		client.WithHealClient(heal.NewClient(ctx, healOptions...)),
 		client.WithAdditionalFunctionality(
-			updatepath.NewClient(c.Name),
+			//ensureexpires.NewClient(3*time.Minute),
 			clientinfo.NewClient(),
 			upstreamrefresh.NewClient(ctx),
 			sriovtoken.NewClient(),
@@ -320,7 +319,7 @@ func main() {
 			dnsClient,
 			excludedprefixes.NewClient(excludedprefixes.WithAwarenessGroups(c.AwarenessGroups)),
 		),
-		client.WithDialTimeout(30*time.Second),
+		client.WithDialTimeout(c.DialTimeout),
 		client.WithDialOptions(dialOptions...),
 	)
 
@@ -343,6 +342,7 @@ func main() {
 	// Create Network Service Manager monitorClient
 	// ********************************************************************************
 	dialCtx, cancelDial := context.WithTimeout(signalCtx, c.DialTimeout)
+	defer cancelDial()
 	defer cancelDial()
 
 	logger.Infof("NSC: Connecting to Network Service Manager %v", c.ConnectTo.String())
