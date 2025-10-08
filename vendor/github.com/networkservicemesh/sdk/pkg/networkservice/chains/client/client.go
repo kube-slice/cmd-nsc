@@ -21,6 +21,7 @@ import (
 	"context"
 	"github.com/google/uuid"
 	"github.com/networkservicemesh/api/pkg/api/networkservice"
+	"github.com/networkservicemesh/sdk/pkg/networkservice/common/refresh"
 
 	"github.com/networkservicemesh/sdk/pkg/networkservice/common/begin"
 	"github.com/networkservicemesh/sdk/pkg/networkservice/common/clientconn"
@@ -41,7 +42,7 @@ func NewClient(ctx context.Context, clientOpts ...Option) networkservice.Network
 		name:            "client-" + uuid.New().String(),
 		authorizeClient: null.NewClient(),
 		healClient:      null.NewClient(),
-		refreshClient:   null.NewClient(),
+		refreshClient:   refresh.NewClient(ctx),
 	}
 	for _, opt := range clientOpts {
 		opt(opts)

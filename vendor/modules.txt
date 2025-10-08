@@ -88,7 +88,7 @@ github.com/networkservicemesh/api/pkg/api/networkservice/mechanisms/common
 github.com/networkservicemesh/api/pkg/api/networkservice/mechanisms/kernel
 github.com/networkservicemesh/api/pkg/api/networkservice/mechanisms/vfio
 github.com/networkservicemesh/api/pkg/api/registry
-# github.com/networkservicemesh/sdk v1.5.0 => github.com/kube-slice/nsm-sdk v1.5.5-kbs-nsm-sidecar.0.20251007080838-f1073afb8ea8
+# github.com/networkservicemesh/sdk v1.5.0 => github.com/kube-slice/nsm-sdk v1.5.5-kbs-nsm-sidecar.0.20251008044927-4ab5aa9ebf6a
 ## explicit; go 1.18
 github.com/networkservicemesh/sdk/pkg/networkservice/chains/client
 github.com/networkservicemesh/sdk/pkg/networkservice/common/authorize
@@ -104,6 +104,7 @@ github.com/networkservicemesh/sdk/pkg/networkservice/common/mechanisms
 github.com/networkservicemesh/sdk/pkg/networkservice/common/mechanisms/kernel
 github.com/networkservicemesh/sdk/pkg/networkservice/common/mechanisms/sendfd
 github.com/networkservicemesh/sdk/pkg/networkservice/common/null
+github.com/networkservicemesh/sdk/pkg/networkservice/common/refresh
 github.com/networkservicemesh/sdk/pkg/networkservice/common/retry
 github.com/networkservicemesh/sdk/pkg/networkservice/common/trimpath
 github.com/networkservicemesh/sdk/pkg/networkservice/common/updatepath
