@@ -45,7 +45,9 @@ func NewServer(opts ...Option) networkservice.NetworkServiceServer {
 
 func (m *kernelMechanismServer) Request(ctx context.Context, request *networkservice.NetworkServiceRequest) (*networkservice.Connection, error) {
 	if mechanism := kernelmech.ToMechanism(request.GetConnection().GetMechanism()); mechanism != nil {
-		mechanism.SetNetNSURL(netNSURL)
+		if _, ok := mechanism.GetParameters()[kernelmech.NetNSURL]; !ok {
+			mechanism.SetNetNSURL(netNSURL)
+		}
 		if m.interfaceName != "" {
 			mechanism.SetInterfaceName(m.interfaceName)
 		} else {

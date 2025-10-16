@@ -16,7 +16,6 @@ require (
 	github.com/pkg/errors v0.9.1
 	github.com/sirupsen/logrus v1.9.3
 	github.com/spiffe/go-spiffe/v2 v2.5.0
-	github.com/spiffe/spire-api-sdk v1.13.1
 	github.com/stretchr/testify v1.10.0
 	github.com/vishvananda/netns v0.0.0-20211101163701-50045581ed74
 	google.golang.org/grpc v1.74.2
@@ -26,7 +25,7 @@ require (
 	k8s.io/client-go v0.34.1
 )
 
-replace github.com/networkservicemesh/sdk v1.5.0 => github.com/kubeslice/nsm-sdk v1.5.5-kbs-nsm-sidecar
+replace github.com/networkservicemesh/sdk v1.5.0 => github.com/kube-slice/nsm-sdk v1.5.5-kbs-nsm-sidecar.0.20251013043149-09d5fdc166fa
 
 require (
 	cloud.google.com/go/compute/metadata v0.7.0 // indirect

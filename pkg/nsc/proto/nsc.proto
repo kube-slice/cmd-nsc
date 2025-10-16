@@ -1,8 +1,9 @@
 syntax = "proto3";
 
-package netns;
-option go_package = "pkg/netns;netns";
-service NetNSService {
+package nsc;
+
+option go_package = "generated/nsc; nsc";
+service NSCService {
   // Receives pod name and namespace
   rpc ProcessPod(PodRequest) returns (PodResponse) {}
 }
@@ -10,6 +11,8 @@ service NetNSService {
 message PodRequest {
   string Name = 1;
   string Namespace = 2;
+  string Node_name = 3;
+  string Network_service = 4;
 }
 
 message PodResponse {

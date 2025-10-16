@@ -277,7 +277,7 @@ github.com/networkservicemesh/api/pkg/api/networkservice/mechanisms/common
 github.com/networkservicemesh/api/pkg/api/networkservice/mechanisms/kernel
 github.com/networkservicemesh/api/pkg/api/networkservice/mechanisms/vfio
 github.com/networkservicemesh/api/pkg/api/registry
-# github.com/networkservicemesh/sdk v1.5.0 => github.com/kubeslice/nsm-sdk v1.5.5-kbs-nsm-sidecar
+# github.com/networkservicemesh/sdk v1.5.0 => github.com/kube-slice/nsm-sdk v1.5.5-kbs-nsm-sidecar.0.20251013043149-09d5fdc166fa
 ## explicit; go 1.18
 github.com/networkservicemesh/sdk/pkg/networkservice/chains/client
 github.com/networkservicemesh/sdk/pkg/networkservice/common/authorize
@@ -464,10 +464,6 @@ github.com/spiffe/go-spiffe/v2/spiffetls/tlsconfig
 github.com/spiffe/go-spiffe/v2/svid/jwtsvid
 github.com/spiffe/go-spiffe/v2/svid/x509svid
 github.com/spiffe/go-spiffe/v2/workloadapi
-# github.com/spiffe/spire-api-sdk v1.13.1
-## explicit; go 1.23.0
-github.com/spiffe/spire-api-sdk/proto/spire/api/agent/delegatedidentity/v1
-github.com/spiffe/spire-api-sdk/proto/spire/api/types
 # github.com/stretchr/testify v1.10.0
 ## explicit; go 1.17
 github.com/stretchr/testify/assert
