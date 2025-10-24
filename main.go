@@ -212,6 +212,9 @@ func handlensmtask(parentCtx context.Context, clientConfig nscClient) {
 		logger.Fatalf("error processing rootConf from env: %+v", err)
 	}
 	c.Name = clientConfig.podName
+	// set network service
+	nsURL, _ := url.Parse(clientConfig.networkService)
+	c.NetworkServices = []url.URL{*nsURL}
 	level, err := logrus.ParseLevel(c.LogLevel)
 	if err != nil {
 		logrus.Fatalf("invalid log level %s", c.LogLevel)
@@ -425,7 +428,7 @@ func main() {
 	}
 	grpcServer := grpc.NewServer()
 	nscpb.RegisterNSCServiceServer(grpcServer, &server{clientset: clientset})
-	fmt.Println("starting server at 50051")
+	fmt.Println("starting server at 50052")
 	if err := grpcServer.Serve(lis); err != nil {
 		Logger.Fatalf("failed to serve: %v", err.Error())
 	}
@@ -443,12 +446,6 @@ func (s *server) ProcessPod(ctx context.Context, req *nscpb.PodRequest) (*nscpb.
 	fmt.Println("Processing pod:", clientSpec.podName, clientSpec.namespace, clientSpec.nodeName)
 	fmt.Println("NetworkService: ", clientSpec.networkService)
 	fmt.Println("InodeURL: ", clientSpec.inodeUrl)
-	// set env
-	err := os.Setenv("NSM_NETWORK_SERVICES", clientSpec.networkService)
-	if err != nil {
-		return nil, err
-	}
-	os.Setenv("NSM_NAME", clientSpec.podName)
 	// Call your NSM handling logic
 	handlensmtask(ctx, clientSpec)
 
