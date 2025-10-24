@@ -31,8 +31,6 @@ import (
 	"errors"
 	"fmt"
 	nested "github.com/antonfisher/nested-logrus-formatter"
-	"github.com/containerd/containerd"
-	"github.com/containerd/containerd/namespaces"
 	"github.com/edwarnicke/grpcfd"
 	"github.com/kelseyhightower/envconfig"
 	"github.com/networkservicemesh/api/pkg/api/networkservice"
@@ -61,19 +59,14 @@ import (
 	"github.com/networkservicemesh/sdk/pkg/tools/opentelemetry"
 	"github.com/networkservicemesh/sdk/pkg/tools/tracing"
 	"github.com/sirupsen/logrus"
-	"github.com/vishvananda/netns"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
-	v1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"net"
 	"net/url"
 	"os"
-	"runtime"
 	"strings"
-	"syscall"
 	"time"
 )
 
@@ -284,20 +277,6 @@ func handlensmtask(parentCtx context.Context, clientConfig nscClient) {
 	)
 
 	dnsClient := null.NewClient()
-	//if c.LocalDNSServerEnabled {
-	//	dnsConfigsMap := new(dnsconfig.Map)
-	//	dnsClient = dnscontext.NewClient(dnscontext.WithChainContext(ctx), dnscontext.WithDNSConfigsMap(dnsConfigsMap))
-	//	dnsServerHandler := next.NewDNSHandler(
-	//		checkmsg.NewDNSHandler(),
-	//		dnsconfigs.NewDNSHandler(dnsConfigsMap),
-	//		searches.NewDNSHandler(),
-	//		noloop.NewDNSHandler(),
-	//		cache.NewDNSHandler(),
-	//		fanout.NewDNSHandler(),
-	//	)
-	//
-	//	go dnsutils.ListenAndServe(ctx, dnsServerHandler, c.LocalDNSServerAddress)
-	//}
 
 	var healOptions = []heal.Option{heal.WithLivenessCheckInterval(c.LivenessCheckInterval),
 		heal.WithLivenessCheckTimeout(c.LivenessCheckTimeout)}
@@ -453,118 +432,26 @@ func main() {
 }
 
 func (s *server) ProcessPod(ctx context.Context, req *nscpb.PodRequest) (*nscpb.PodResponse, error) {
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
 
 	clientSpec := nscClient{
 		podName:        req.Name,
 		namespace:      req.Namespace,
 		nodeName:       req.NodeName,
 		networkService: req.NetworkService,
+		inodeUrl:       req.InodeURL,
 	}
 	fmt.Println("Processing pod:", clientSpec.podName, clientSpec.namespace, clientSpec.nodeName)
 	fmt.Println("NetworkService: ", clientSpec.networkService)
+	fmt.Println("InodeURL: ", clientSpec.inodeUrl)
 	// set env
 	err := os.Setenv("NSM_NETWORK_SERVICES", clientSpec.networkService)
 	if err != nil {
 		return nil, err
 	}
 	os.Setenv("NSM_NAME", clientSpec.podName)
-	// Get Pod object
-	pod, err := s.clientset.CoreV1().Pods(clientSpec.namespace).Get(ctx, clientSpec.podName, metav1.GetOptions{})
-	if err != nil {
-		return nil, fmt.Errorf("failed to get pod: %w", err)
-	}
-
-	// Get Pod PID (retry a few times if necessary)
-	var pid uint32
-	for i := 0; i < 5; i++ {
-		pid, err = GetPodPID(pod, s.clientset)
-		if err == nil {
-			fmt.Printf("Got PID: %d\n", pid)
-			break
-		}
-		fmt.Printf("Attempt %d: %v\n", i+1, err)
-		time.Sleep(5 * time.Second)
-	}
-	if err != nil {
-		return nil, fmt.Errorf("failed to get pod PID: %w", err)
-	}
-
-	// Get Pod netns
-	podNS, err := netns.GetFromPid(int(pid))
-	if err != nil {
-		return nil, fmt.Errorf("failed to get pod netns: %w", err)
-	}
-	defer podNS.Close()
-
-	file := os.NewFile(uintptr(podNS), fmt.Sprintf("/proc/%d/ns/net", pid))
-	defer file.Close()
-	stat := &syscall.Stat_t{}
-	if err := syscall.Fstat(int(file.Fd()), stat); err != nil {
-		return nil, fmt.Errorf("failed to fstat pod ns fd: %w", err)
-	}
-	inode := stat.Ino
-	inodeURL := fmt.Sprintf("inode://4/%d", inode)
-	clientSpec.inodeUrl = inodeURL
-	fmt.Println("Restored NS, ready to handle NSM request")
-	fmt.Println("Computed inodeURL:", inodeURL)
-	fmt.Println("Pod ns : ", podNS)
 	// Call your NSM handling logic
 	handlensmtask(ctx, clientSpec)
 
 	fmt.Println("Work done for pod", clientSpec.podName)
 	return &nscpb.PodResponse{Status: "Pod processed successfully"}, nil
-}
-
-func GetPodPID(pod *v1.Pod, clientset *kubernetes.Clientset) (uint32, error) {
-	if len(pod.Status.ContainerStatuses) == 0 {
-		return 0, fmt.Errorf("no containers in pod")
-	}
-
-	// Poll until container is running
-	for i := 0; i < 30; i++ { // wait up to ~30s
-		if pod.Status.ContainerStatuses[0].Ready &&
-			pod.Status.ContainerStatuses[0].State.Running != nil {
-			break
-		}
-		time.Sleep(1 * time.Second)
-
-		// refresh Pod status
-		refreshed, err := clientset.CoreV1().Pods(pod.Namespace).Get(
-			context.Background(),
-			pod.Name,
-			metav1.GetOptions{},
-		)
-		if err != nil {
-			return 0, err
-		}
-		pod = refreshed
-	}
-
-	containerID := pod.Status.ContainerStatuses[0].ContainerID
-	parts := strings.Split(containerID, "://")
-	if len(parts) != 2 {
-		return 0, fmt.Errorf("invalid containerID format: %s", containerID)
-	}
-	cid := parts[1]
-
-	client, err := containerd.New("/run/k3s/containerd/containerd.sock")
-	if err != nil {
-		return 0, err
-	}
-	defer client.Close()
-
-	ctx := namespaces.WithNamespace(context.Background(), "k8s.io")
-	container, err := client.LoadContainer(ctx, cid)
-	if err != nil {
-		return 0, err
-	}
-
-	task, err := container.Task(ctx, nil)
-	if err != nil {
-		return 0, err
-	}
-
-	return task.Pid(), nil
 }
