@@ -14,6 +14,7 @@ message PodRequest {
   string Node_name = 3;
   string Network_service = 4;
   string InodeURL = 5;
+  int32 Retry_count = 6;
 }
 
 message PodResponse {

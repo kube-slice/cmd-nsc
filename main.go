@@ -80,6 +80,7 @@ type nscClient struct {
 	namespace      string
 	networkService string
 	inodeUrl       string
+	count          int32
 }
 
 func getResolverAddress() (string, error) {
@@ -322,7 +323,6 @@ func handlensmtask(parentCtx context.Context, clientConfig nscClient) {
 	// ********************************************************************************
 	dialCtx, cancelDial := context.WithTimeout(signalCtx, c.DialTimeout)
 	defer cancelDial()
-	defer cancelDial()
 
 	logger.Infof("NSC: Connecting to Network Service Manager %v", c.ConnectTo.String())
 	cc, err := grpc.DialContext(dialCtx, grpcutils.URLToTarget(&c.ConnectTo), dialOptions...)
@@ -341,7 +341,7 @@ func handlensmtask(parentCtx context.Context, clientConfig nscClient) {
 		fmt.Println("****************************************")
 		fmt.Println(strings.ToUpper(u.Scheme))
 		fmt.Println("****************************************")
-		id := fmt.Sprintf("%s-%d", c.Name, i)
+		id := fmt.Sprintf("%s-%d-%d", c.Name, clientConfig.count, i)
 		var monitoredConnections map[string]*networkservice.Connection
 		monitorCtx, cancelMonitor := context.WithTimeout(signalCtx, c.RequestTimeout)
 		defer cancelMonitor()
@@ -442,6 +442,7 @@ func (s *server) ProcessPod(ctx context.Context, req *nscpb.PodRequest) (*nscpb.
 		nodeName:       req.NodeName,
 		networkService: req.NetworkService,
 		inodeUrl:       req.InodeURL,
+		count:          req.RetryCount,
 	}
 	fmt.Println("Processing pod:", clientSpec.podName, clientSpec.namespace, clientSpec.nodeName)
 	fmt.Println("NetworkService: ", clientSpec.networkService)
