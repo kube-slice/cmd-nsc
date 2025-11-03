@@ -66,7 +66,9 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -316,8 +318,22 @@ func handlensmtask(parentCtx context.Context, clientConfig nscClient) {
 	// ********************************************************************************
 	// Configure signal handling context
 	// ********************************************************************************
-	signalCtx := parentCtx
+	signalCtx, cancelSignalCtx := signal.NotifyContext(
+		ctx,
+		os.Interrupt,
+		// More Linux signals here
+		syscall.SIGHUP,
+		syscall.SIGTERM,
+		syscall.SIGQUIT,
+	)
+	defer cancelSignalCtx()
 
+	go func() {
+		select {
+		case <-parentCtx.Done():
+			cancelSignalCtx()
+		}
+	}()
 	// ********************************************************************************
 	// Create Network Service Manager monitorClient
 	// ********************************************************************************
