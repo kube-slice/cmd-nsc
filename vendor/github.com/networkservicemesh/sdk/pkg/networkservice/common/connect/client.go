@@ -18,6 +18,7 @@ package connect
 
 import (
 	"context"
+	"time"
 
 	"github.com/networkservicemesh/api/pkg/api/networkservice"
 	"github.com/pkg/errors"
@@ -27,26 +28,58 @@ import (
 	"github.com/networkservicemesh/sdk/pkg/networkservice/common/clientconn"
 )
 
-type connectClient struct{}
+type connectClient struct {
+	cancel context.CancelFunc
+}
+
+const (
+	loadAttempts    = 50
+	loadSleepMillis = 50
+)
 
 // NewClient - returns a connect chain element
-func NewClient() networkservice.NetworkServiceClient {
-	return &connectClient{}
+func NewClient(cancelFunc context.CancelFunc) networkservice.NetworkServiceClient {
+	return &connectClient{cancel: cancelFunc}
+}
+
+func (c *connectClient) tryLoadClientConn(ctx context.Context) (grpc.ClientConnInterface, bool) {
+	for i := 0; i < loadAttempts; i++ {
+		// If caller's ctx is done, stop retrying immediately.
+		select {
+		case <-ctx.Done():
+			return nil, false
+		default:
+		}
+
+		if cc, loaded := clientconn.Load(ctx); loaded {
+			return cc, true
+		}
+
+		time.Sleep(loadSleepMillis * time.Millisecond)
+	}
+	return nil, false
 }
 
 func (c *connectClient) Request(ctx context.Context, request *networkservice.NetworkServiceRequest, opts ...grpc.CallOption) (*networkservice.Connection, error) {
-	cc, loaded := clientconn.Load(ctx)
+	cc, loaded := c.tryLoadClientConn(ctx)
 	if !loaded {
-		return nil, errors.New("no grpc.ClientConnInterface provided")
+		// If we have a cancel func, call it to signal higher-level shutdown/retry logic.
+		if c.cancel != nil {
+			c.cancel()
+		}
+		return nil, errors.New("no grpc.ClientConnInterface provided after retries")
 	}
 	conn, err := networkservice.NewNetworkServiceClient(cc).Request(ctx, request, opts...)
 	return conn, err
 }
 
 func (c *connectClient) Close(ctx context.Context, conn *networkservice.Connection, opts ...grpc.CallOption) (*emptypb.Empty, error) {
-	cc, loaded := clientconn.Load(ctx)
+	cc, loaded := c.tryLoadClientConn(ctx)
 	if !loaded {
-		return nil, errors.New("no grpc.ClientConnInterface provided")
+		if c.cancel != nil {
+			c.cancel()
+		}
+		return nil, errors.New("no grpc.ClientConnInterface provided after retries")
 	}
 	return networkservice.NewNetworkServiceClient(cc).Close(ctx, conn, opts...)
 }

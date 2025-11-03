@@ -66,7 +66,9 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -287,8 +289,16 @@ func handlensmtask(parentCtx context.Context, clientConfig nscClient) {
 	if c.LivenessCheckEnabled {
 		healOptions = append(healOptions, heal.WithLivenessCheck(kernelheal.KernelLivenessCheck))
 	}
-
-	nsmClient := client.NewClient(ctx,
+	signalCtx, cancelSignalCtx := signal.NotifyContext(
+		ctx,
+		os.Interrupt,
+		// More Linux signals here
+		syscall.SIGHUP,
+		syscall.SIGTERM,
+		syscall.SIGQUIT,
+	)
+	defer cancelSignalCtx()
+	nsmClient := client.NewClient(ctx, cancelSignalCtx,
 		client.WithClientURL(&c.ConnectTo),
 		client.WithName(c.Name),
 		//client.WithAuthorizeClient(authorize.NewClient(authorize.Any())),
@@ -309,19 +319,24 @@ func handlensmtask(parentCtx context.Context, clientConfig nscClient) {
 		client.WithDialTimeout(c.DialTimeout),
 		client.WithDialOptions(dialOptions...),
 	)
-
+	go func() {
+		select {
+		case <-signalCtx.Done():
+			return
+		case <-parentCtx.Done():
+			cancelSignalCtx()
+		}
+	}()
 	nsmClient = retry.NewClient(nsmClient, retry.WithTryTimeout(c.RequestTimeout), retry.WithInterval(5*time.Second))
 
 	// ********************************************************************************
 	// Configure signal handling context
 	// ********************************************************************************
-	signalCtx := parentCtx
 
 	// ********************************************************************************
 	// Create Network Service Manager monitorClient
 	// ********************************************************************************
 	dialCtx, cancelDial := context.WithTimeout(signalCtx, c.DialTimeout)
-	defer cancelDial()
 	defer cancelDial()
 
 	logger.Infof("NSC: Connecting to Network Service Manager %v", c.ConnectTo.String())
