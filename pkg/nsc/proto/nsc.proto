@@ -6,8 +6,15 @@ option go_package = "generated/nsc; nsc";
 service NSCService {
   // Receives pod name and namespace
   rpc ProcessPod(PodRequest) returns (PodResponse) {}
+  rpc DiscoverServer(ClientNode) returns (ServerAddr) {}
 }
 
+message ClientNode {
+  string Node_name = 1;
+}
+message ServerAddr {
+  string Server_Ip =1;
+}
 message PodRequest {
   string Name = 1;
   string Namespace = 2;

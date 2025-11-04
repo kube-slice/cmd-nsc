@@ -19,7 +19,8 @@ import (
 const _ = grpc.SupportPackageIsVersion7
 
 const (
-	NSCService_ProcessPod_FullMethodName = "/nsc.NSCService/ProcessPod"
+	NSCService_ProcessPod_FullMethodName     = "/nsc.NSCService/ProcessPod"
+	NSCService_DiscoverServer_FullMethodName = "/nsc.NSCService/DiscoverServer"
 )
 
 // NSCServiceClient is the client API for NSCService service.
@@ -28,6 +29,7 @@ const (
 type NSCServiceClient interface {
 	// Receives pod name and namespace
 	ProcessPod(ctx context.Context, in *PodRequest, opts ...grpc.CallOption) (*PodResponse, error)
+	DiscoverServer(ctx context.Context, in *ClientNode, opts ...grpc.CallOption) (*ServerAddr, error)
 }
 
 type nSCServiceClient struct {
@@ -47,12 +49,22 @@ func (c *nSCServiceClient) ProcessPod(ctx context.Context, in *PodRequest, opts 
 	return out, nil
 }
 
+func (c *nSCServiceClient) DiscoverServer(ctx context.Context, in *ClientNode, opts ...grpc.CallOption) (*ServerAddr, error) {
+	out := new(ServerAddr)
+	err := c.cc.Invoke(ctx, NSCService_DiscoverServer_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // NSCServiceServer is the server API for NSCService service.
 // All implementations must embed UnimplementedNSCServiceServer
 // for forward compatibility
 type NSCServiceServer interface {
 	// Receives pod name and namespace
 	ProcessPod(context.Context, *PodRequest) (*PodResponse, error)
+	DiscoverServer(context.Context, *ClientNode) (*ServerAddr, error)
 	mustEmbedUnimplementedNSCServiceServer()
 }
 
@@ -62,6 +74,9 @@ type UnimplementedNSCServiceServer struct {
 
 func (UnimplementedNSCServiceServer) ProcessPod(context.Context, *PodRequest) (*PodResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method ProcessPod not implemented")
+}
+func (UnimplementedNSCServiceServer) DiscoverServer(context.Context, *ClientNode) (*ServerAddr, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method DiscoverServer not implemented")
 }
 func (UnimplementedNSCServiceServer) mustEmbedUnimplementedNSCServiceServer() {}
 
@@ -94,6 +109,24 @@ func _NSCService_ProcessPod_Handler(srv interface{}, ctx context.Context, dec fu
 	return interceptor(ctx, in, info, handler)
 }
 
+func _NSCService_DiscoverServer_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ClientNode)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(NSCServiceServer).DiscoverServer(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: NSCService_DiscoverServer_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(NSCServiceServer).DiscoverServer(ctx, req.(*ClientNode))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // NSCService_ServiceDesc is the grpc.ServiceDesc for NSCService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -104,6 +137,10 @@ var NSCService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ProcessPod",
 			Handler:    _NSCService_ProcessPod_Handler,
+		},
+		{
+			MethodName: "DiscoverServer",
+			Handler:    _NSCService_DiscoverServer_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

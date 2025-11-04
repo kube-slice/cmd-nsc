@@ -61,6 +61,7 @@ import (
 	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"net"
@@ -468,4 +469,36 @@ func (s *server) ProcessPod(ctx context.Context, req *nscpb.PodRequest) (*nscpb.
 
 	fmt.Println("Work done for pod", clientSpec.podName)
 	return &nscpb.PodResponse{Status: "Pod processed successfully"}, nil
+}
+
+func getPodIp(nodeName string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cfg, err := rest.InClusterConfig()
+	if err != nil {
+		return "", err
+	}
+	clientset, err := kubernetes.NewForConfig(cfg)
+	if err != nil {
+		return "", err
+	}
+
+	ListOpts := metav1.ListOptions{
+		LabelSelector: "app=cmd-nsc-grpc-server",
+		FieldSelector: "spec.nodeName=" + nodeName,
+	}
+	pods, err := clientset.CoreV1().Pods("kubeslice-system").List(ctx, ListOpts)
+	if err != nil {
+		return "", err
+	}
+	for _, pod := range pods.Items {
+		if pod.Status.PodIP != "" {
+			return pod.Status.PodIP + ":50052", nil
+		}
+	}
+	return "", fmt.Errorf("no pod with label app=cmd-nsc-grpc-server found on node %s", nodeName)
+}
+func (s *server) DiscoverServer(ctx context.Context, req *nscpb.ClientNode) (*nscpb.ServerAddr, error) {
+	serverAddr, err := getPodIp(req.NodeName)
+	return &nscpb.ServerAddr{Server_Ip: serverAddr}, err
 }
