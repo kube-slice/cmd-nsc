@@ -32,7 +32,8 @@ type updatePathClient struct {
 }
 
 // NewClient - creates a new updatePath client to update connection path.
-//             name - name of the client
+//
+//	name - name of the client
 //
 // Workflow are documented in common.go
 func NewClient(name string) networkservice.NetworkServiceClient {

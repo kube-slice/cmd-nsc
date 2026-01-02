@@ -19,9 +19,9 @@ package client
 
 import (
 	"context"
-
 	"github.com/google/uuid"
 	"github.com/networkservicemesh/api/pkg/api/networkservice"
+	"github.com/networkservicemesh/sdk/pkg/networkservice/common/refresh"
 
 	"github.com/networkservicemesh/sdk/pkg/networkservice/common/begin"
 	"github.com/networkservicemesh/sdk/pkg/networkservice/common/clientconn"
@@ -29,7 +29,6 @@ import (
 	"github.com/networkservicemesh/sdk/pkg/networkservice/common/connect"
 	"github.com/networkservicemesh/sdk/pkg/networkservice/common/dial"
 	"github.com/networkservicemesh/sdk/pkg/networkservice/common/null"
-	"github.com/networkservicemesh/sdk/pkg/networkservice/common/refresh"
 	"github.com/networkservicemesh/sdk/pkg/networkservice/common/trimpath"
 	"github.com/networkservicemesh/sdk/pkg/networkservice/common/updatepath"
 	"github.com/networkservicemesh/sdk/pkg/networkservice/core/chain"
@@ -37,7 +36,7 @@ import (
 )
 
 // NewClient - returns case NSM client.
-//             - ctx    - context for the lifecycle of the *Client* itself.  Cancel when discarding the client.
+//   - ctx    - context for the lifecycle of the *Client* itself.  Cancel when discarding the client.
 func NewClient(ctx context.Context, clientOpts ...Option) networkservice.NetworkServiceClient {
 	var opts = &clientOptions{
 		name:            "client-" + uuid.New().String(),
