@@ -48,12 +48,49 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           flavor: |
             latest=false
+          labels: |
+            name="Kubeslice nsc"
+            maintainer=AppsCode
+            vendor=AppsCode
+            version={{tag}}
+            release={{tag}}
+            summary=Network Service Mesh Client
+            description=Network Service Mesh Client
 
       - name: "Build and push"
-        uses: docker/build-push-action@v2
+        uses: docker/build-push-action@v5
         with:
           file: Dockerfile
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Extract Docker metadata for UBI image
+        id: ubi
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}}-ubi
+          flavor: |
+            latest=false
+          labels: |
+            name="Kubeslice nsc"
+            maintainer=AppsCode
+            vendor=AppsCode
+            version={{tag}}
+            release={{tag}}
+            summary=Network Service Mesh Client
+            description=Network Service Mesh Client
+
+      - name: "Build and push UBI image"
+        uses: docker/build-push-action@v5
+        with:
+          file: Dockerfile.ubi
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.ubi.outputs.tags }}
+          labels: ${{ steps.ubi.outputs.labels }}

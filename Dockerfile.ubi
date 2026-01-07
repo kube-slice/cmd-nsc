@@ -26,7 +26,11 @@ CMD go test -test.v ./...
 FROM test as debug
 CMD dlv -l :40000 --headless=true --api-version=2 test -test.v ./...
 
-FROM alpine as runtime
+FROM registry.access.redhat.com/ubi10/ubi-minimal as runtime
+
+RUN mkdir -p /licenses
+COPY LICENSE /licenses/
+
 COPY --from=build /bin/app /bin/app
 
 USER 65534
