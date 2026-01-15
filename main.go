@@ -484,7 +484,7 @@ func getPodIp(nodeName string) (string, error) {
 	}
 
 	ListOpts := metav1.ListOptions{
-		LabelSelector: "app=cmd-nsc-grpc-server",
+		LabelSelector: "app=nsc-grpc-server",
 		FieldSelector: "spec.nodeName=" + nodeName,
 	}
 	pods, err := clientset.CoreV1().Pods("kubeslice-system").List(ctx, ListOpts)
@@ -496,7 +496,7 @@ func getPodIp(nodeName string) (string, error) {
 			return pod.Status.PodIP + ":50052", nil
 		}
 	}
-	return "", fmt.Errorf("no pod with label app=cmd-nsc-grpc-server found on node %s", nodeName)
+	return "", fmt.Errorf("no pod with label app=nsc-grpc-server found on node %s", nodeName)
 }
 func (s *server) DiscoverServer(ctx context.Context, req *nscpb.ClientNode) (*nscpb.ServerAddr, error) {
 	serverAddr, err := getPodIp(req.NodeName)
