@@ -33,6 +33,8 @@ type retryClient struct {
 	interval   time.Duration
 	tryTimeout time.Duration
 	client     networkservice.NetworkServiceClient
+	cancel     context.CancelFunc
+	maxRetry   int
 }
 
 // Option configuress retry.Client instance.
@@ -53,11 +55,13 @@ func WithInterval(interval time.Duration) Option {
 }
 
 // NewClient - returns a connect chain element
-func NewClient(client networkservice.NetworkServiceClient, opts ...Option) networkservice.NetworkServiceClient {
+func NewClient(client networkservice.NetworkServiceClient, Cancel context.CancelFunc, opts ...Option) networkservice.NetworkServiceClient {
 	var result = &retryClient{
-		interval:   time.Millisecond * 200,
+		interval:   time.Second * 1,
 		tryTimeout: time.Second * 15,
+		cancel:     Cancel,
 		client:     client,
+		maxRetry:   20,
 	}
 
 	for _, opt := range opts {
@@ -77,12 +81,19 @@ func (r *retryClient) Request(ctx context.Context, request *networkservice.Netwo
 		cancel()
 
 		if err != nil {
+			r.maxRetry--
+			if r.maxRetry <= 0 {
+				logger.Infof("Retry request limit exceeded")
+				r.cancel()
+				return nil, err
+			}
 			logger.Errorf("try attempt has failed: %v", err.Error())
 
 			select {
 			case <-ctx.Done():
 				return nil, ctx.Err()
 			case <-c.After(r.interval):
+				logger.Infof("*****try again****")
 				continue
 			}
 		}

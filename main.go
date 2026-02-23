@@ -27,6 +27,8 @@ import (
 	"bufio"
 	"context"
 	"crypto/md5"
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -314,7 +316,7 @@ func handlensmtask(parentCtx context.Context, clientConfig nscClient) {
 		client.WithDialOptions(dialOptions...),
 	)
 
-	nsmClient = retry.NewClient(nsmClient, retry.WithTryTimeout(c.RequestTimeout), retry.WithInterval(5*time.Second))
+	nsmClient = retry.NewClient(nsmClient, cancel, retry.WithTryTimeout(c.RequestTimeout), retry.WithInterval(5*time.Second))
 
 	// ********************************************************************************
 	// Configure signal handling context
@@ -358,7 +360,7 @@ func handlensmtask(parentCtx context.Context, clientConfig nscClient) {
 		fmt.Println("****************************************")
 		fmt.Println(strings.ToUpper(u.Scheme))
 		fmt.Println("****************************************")
-		id := fmt.Sprintf("%s-%d-%d", c.Name, clientConfig.count, i)
+		id := fmt.Sprintf("%s-%d-%d-%s", c.Name, clientConfig.count, i, shortRandomSuffix())
 		var monitoredConnections map[string]*networkservice.Connection
 		monitorCtx, cancelMonitor := context.WithTimeout(signalCtx, c.RequestTimeout)
 		defer cancelMonitor()
@@ -413,13 +415,15 @@ func handlensmtask(parentCtx context.Context, clientConfig nscClient) {
 
 		resp, err := nsmClient.Request(ctx, request)
 		if err != nil {
-			logger.Fatalf("failed connect to NSMgr: %v", err.Error())
+			logger.Errorf("failed connect to NSMgr: %v", err.Error())
 		}
 
 		defer func() {
-			closeCtx, cancelClose := context.WithTimeout(ctx, c.RequestTimeout)
+			closeCtx, cancelClose := context.WithTimeout(ctx, 30*time.Second)
 			defer cancelClose()
 			_, _ = nsmClient.Close(closeCtx, resp)
+			logger.Infof("closed connection to %v", u.NetworkService())
+			cancel()
 		}()
 
 		logger.Infof("successfully connected to %v. Response: %v", u.NetworkService(), resp)
@@ -429,6 +433,17 @@ func handlensmtask(parentCtx context.Context, clientConfig nscClient) {
 	<-signalCtx.Done()
 	fmt.Println("signalctx cancelled")
 }
+
+func shortRandomSuffix() string {
+	b := make([]byte, 6)
+	_, err := rand.Read(b)
+	if err != nil {
+		// Very rare fallback — use timestamp + pid
+		return fmt.Sprintf("t%x", time.Now().UnixNano()^(int64(os.Getpid())<<32))
+	}
+	return base64.RawURLEncoding.EncodeToString(b)[:8]
+}
+
 func main() {
 	config, err := rest.InClusterConfig()
 	Logger := log.FromContext(context.Background())
@@ -451,6 +466,29 @@ func main() {
 	}
 }
 
+func podHasLabel(podName string, namespace string) (bool, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cfg, err := rest.InClusterConfig()
+	if err != nil {
+		return false, err
+	}
+	clientset, err := kubernetes.NewForConfig(cfg)
+	if err != nil {
+		return false, err
+	}
+
+	pod, err := clientset.CoreV1().Pods(namespace).Get(ctx, podName, metav1.GetOptions{})
+	if err != nil {
+		return false, err
+	}
+
+	if pod.Labels == nil {
+		return false, nil
+	}
+	_, exists := pod.Labels["kubeslice.io/slice"]
+	return exists, nil
+}
 func (s *server) ProcessPod(ctx context.Context, req *nscpb.PodRequest) (*nscpb.PodResponse, error) {
 
 	clientSpec := nscClient{
@@ -460,6 +498,13 @@ func (s *server) ProcessPod(ctx context.Context, req *nscpb.PodRequest) (*nscpb.
 		networkService: req.NetworkService,
 		inodeUrl:       req.InodeURL,
 		count:          req.RetryCount,
+	}
+	check, err := podHasLabel(clientSpec.podName, clientSpec.namespace)
+	if err != nil {
+		return &nscpb.PodResponse{Status: "Error checking pod labels"}, err
+	}
+	if !check {
+		return &nscpb.PodResponse{Status: "Pod does not have kubeslice.io/slice label"}, nil
 	}
 	fmt.Println("Processing pod:", clientSpec.podName, clientSpec.namespace, clientSpec.nodeName)
 	fmt.Println("NetworkService: ", clientSpec.networkService)
