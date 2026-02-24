@@ -22,7 +22,7 @@ require (
 	k8s.io/client-go v0.34.1
 )
 
-replace github.com/networkservicemesh/sdk v1.5.0 => github.com/kube-slice/nsm-sdk v1.6.0-ac-nsc
+replace github.com/networkservicemesh/sdk v1.5.0 => github.com/kube-slice/nsm-sdk v1.6.1-ac-nsc
 
 require (
 	github.com/Microsoft/go-winio v0.6.2 // indirect
