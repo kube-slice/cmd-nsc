@@ -12,6 +12,6 @@ on:
 jobs:
   update-deployments-k8s:
     if: ${{ github.repository != 'networkservicemesh/cmd-template' && (github.event.workflow_run.conclusion == 'success' && github.actor == 'nsmbot' || github.event_name == 'push') }}
-    uses: networkservicemesh/.github/.github/workflows/update-deployments.yaml@main
+    uses: networkservicemesh/.github/.github/workflows/update-deployments.yaml@fe8cd964c2e13a408077d9a78b939934e3b4521f # main
     secrets:
       token: ${{ secrets.NSM_BOT_GITHUB_TOKEN }}

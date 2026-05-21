@@ -23,13 +23,13 @@ jobs:
 
   check-gomod-deps:
     needs: get-tag
-    uses: networkservicemesh/.github/.github/workflows/check-gomod-deps.yaml@main
+    uses: networkservicemesh/.github/.github/workflows/check-gomod-deps.yaml@fe8cd964c2e13a408077d9a78b939934e3b4521f # main
     with:
       tag: ${{ needs.get-tag.outputs.tag }}
 
   create-release:
     needs: [get-tag, check-gomod-deps]
-    uses: networkservicemesh/.github/.github/workflows/release.yaml@main
+    uses: networkservicemesh/.github/.github/workflows/release.yaml@fe8cd964c2e13a408077d9a78b939934e3b4521f # main
     with:
       tag: ${{ needs.get-tag.outputs.tag }}
     secrets:
@@ -37,7 +37,7 @@ jobs:
 
   docker:
     needs: [get-tag, check-gomod-deps]
-    uses: networkservicemesh/.github/.github/workflows/docker-release.yaml@main
+    uses: networkservicemesh/.github/.github/workflows/docker-release.yaml@fe8cd964c2e13a408077d9a78b939934e3b4521f # main
     with:
       tag: ${{ needs.get-tag.outputs.tag }}
     secrets:
@@ -46,7 +46,7 @@ jobs:
   check-branch:
     name: Check release branch in deployments-k8s
     needs: [get-tag, create-release]
-    uses: networkservicemesh/.github/.github/workflows/check-release-branch.yaml@main
+    uses: networkservicemesh/.github/.github/workflows/check-release-branch.yaml@fe8cd964c2e13a408077d9a78b939934e3b4521f # main
     with:
       tag: ${{ needs.get-tag.outputs.tag }}
     secrets:
@@ -56,7 +56,7 @@ jobs:
     name: Update deployments-k8s
     needs: [get-tag, check-branch]
     if: ${{ github.repository != 'networkservicemesh/cmd-template' }}
-    uses: networkservicemesh/.github/.github/workflows/release-deployments.yaml@main
+    uses: networkservicemesh/.github/.github/workflows/release-deployments.yaml@fe8cd964c2e13a408077d9a78b939934e3b4521f # main
     with:
       tag: ${{ needs.get-tag.outputs.tag }}
     secrets:

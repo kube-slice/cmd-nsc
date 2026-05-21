@@ -8,35 +8,35 @@ on:
   pull_request:
 jobs:
   yamllint:
-    uses: networkservicemesh/.github/.github/workflows/yamllint.yaml@main
+    uses: networkservicemesh/.github/.github/workflows/yamllint.yaml@fe8cd964c2e13a408077d9a78b939934e3b4521f # main
     with:
       config_file: "./.yamllint.yml"
 
   shellcheck:
-    uses: networkservicemesh/.github/.github/workflows/shellcheck.yaml@main
+    uses: networkservicemesh/.github/.github/workflows/shellcheck.yaml@fe8cd964c2e13a408077d9a78b939934e3b4521f # main
 
   golangci-lint:
-    uses: networkservicemesh/.github/.github/workflows/golangci-lint.yaml@main
+    uses: networkservicemesh/.github/.github/workflows/golangci-lint.yaml@fe8cd964c2e13a408077d9a78b939934e3b4521f # main
 
   excludeFmtErrorf:
-    uses: networkservicemesh/.github/.github/workflows/exclude-fmt-errorf.yaml@main
+    uses: networkservicemesh/.github/.github/workflows/exclude-fmt-errorf.yaml@fe8cd964c2e13a408077d9a78b939934e3b4521f # main
 
   restrictNSMDeps:
-    uses: networkservicemesh/.github/.github/workflows/restrict-nsm-deps.yaml@main
+    uses: networkservicemesh/.github/.github/workflows/restrict-nsm-deps.yaml@fe8cd964c2e13a408077d9a78b939934e3b4521f # main
     with:
       allowed_repositories: "api, sdk, sdk-k8s, sdk-kernel, sdk-sriov, sdk-vpp"
 
   checkgomod:
-    uses: networkservicemesh/.github/.github/workflows/checkgomod.yaml@main
+    uses: networkservicemesh/.github/.github/workflows/checkgomod.yaml@fe8cd964c2e13a408077d9a78b939934e3b4521f # main
 
   gogenerate:
-    uses: networkservicemesh/.github/.github/workflows/cmd-gogenerate.yaml@main
+    uses: networkservicemesh/.github/.github/workflows/cmd-gogenerate.yaml@fe8cd964c2e13a408077d9a78b939934e3b4521f # main
 
   excludereplace:
-    uses: networkservicemesh/.github/.github/workflows/exclude-replace.yaml@main
+    uses: networkservicemesh/.github/.github/workflows/exclude-replace.yaml@fe8cd964c2e13a408077d9a78b939934e3b4521f # main
 
   docker-build-and-test:
     if: github.repository != 'networkservicemesh/cmd-template'
-    uses: networkservicemesh/.github/.github/workflows/docker-build-and-test.yaml@main
+    uses: networkservicemesh/.github/.github/workflows/docker-build-and-test.yaml@fe8cd964c2e13a408077d9a78b939934e3b4521f # main
     secrets:
       token: ${{ secrets.GITHUB_TOKEN }}

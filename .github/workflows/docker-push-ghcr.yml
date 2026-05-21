@@ -12,4 +12,4 @@ on:
 jobs:
   push:
     if: ${{ github.repository != 'networkservicemesh/cmd-template' && (github.event.workflow_run.conclusion == 'success' && github.actor == 'nsmbot' || github.event_name == 'push') }}
-    uses: networkservicemesh/.github/.github/workflows/docker-push-ghcr.yaml@main
+    uses: networkservicemesh/.github/.github/workflows/docker-push-ghcr.yaml@fe8cd964c2e13a408077d9a78b939934e3b4521f # main
