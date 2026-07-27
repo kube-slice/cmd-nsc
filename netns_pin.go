@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/golang/protobuf/ptypes/empty"
 	"google.golang.org/grpc"
@@ -29,33 +30,59 @@ import (
 // Sitting between the mechanisms client and sendfd, this element restores the intended target
 // before the fd is taken.
 type netnsPinClient struct {
+	// inodeURL identifies the target namespace itself, and stays valid for the life of the pod.
 	inodeURL string
+	// resolve turns that into a path. Called per request rather than once, because the path is
+	// /proc/<pid>/ns/net and the process it names can exit while the namespace lives on -- a
+	// container restart is enough. A stale path would send every later heal to a dead target.
+	resolve func(string) (string, error)
 }
 
-// NewNetNSPinClient returns a client that pins the kernel mechanism's netns to inodeURL.
+// NewNetNSPinClient returns a client that pins the kernel mechanism to the netns identified by
+// inodeURL, resolving it to a usable path on each request.
 func NewNetNSPinClient(inodeURL string) networkservice.NetworkServiceClient {
-	return &netnsPinClient{inodeURL: inodeURL}
+	return &netnsPinClient{inodeURL: inodeURL, resolve: resolveNetNSFileURL}
 }
 
 func (c *netnsPinClient) Request(ctx context.Context, request *networkservice.NetworkServiceRequest, opts ...grpc.CallOption) (*networkservice.Connection, error) {
-	c.pin(request.GetConnection().GetMechanism())
+	netNSURL, err := c.currentNetNSURL()
+	if err != nil {
+		return nil, err
+	}
+	pin(request.GetConnection().GetMechanism(), netNSURL)
 	for _, m := range request.GetMechanismPreferences() {
-		c.pin(m)
+		pin(m, netNSURL)
 	}
 	return next.Client(ctx).Request(ctx, request, opts...)
 }
 
+// currentNetNSURL resolves the target namespace afresh, so a path that named a since-exited
+// process is replaced rather than reused.
+func (c *netnsPinClient) currentNetNSURL() (string, error) {
+	if c.inodeURL == "" {
+		return "", nil
+	}
+	netNSURL, err := c.resolve(c.inodeURL)
+	if err != nil {
+		return "", fmt.Errorf("resolving netns %q: %w", c.inodeURL, err)
+	}
+	return netNSURL, nil
+}
+
 func (c *netnsPinClient) Close(ctx context.Context, conn *networkservice.Connection, opts ...grpc.CallOption) (*empty.Empty, error) {
-	c.pin(conn.GetMechanism())
+	// A namespace that has already gone is not a reason to refuse to tear the connection down.
+	if netNSURL, err := c.currentNetNSURL(); err == nil {
+		pin(conn.GetMechanism(), netNSURL)
+	}
 	return next.Client(ctx).Close(ctx, conn, opts...)
 }
 
-func (c *netnsPinClient) pin(m *networkservice.Mechanism) {
-	if c.inodeURL == "" || m == nil || m.GetType() != kernelmech.MECHANISM {
+func pin(m *networkservice.Mechanism, netNSURL string) {
+	if netNSURL == "" || m == nil || m.GetType() != kernelmech.MECHANISM {
 		return
 	}
 	if m.GetParameters() == nil {
 		m.Parameters = make(map[string]string)
 	}
-	m.GetParameters()[common.InodeURL] = c.inodeURL
+	m.GetParameters()[common.InodeURL] = netNSURL
 }

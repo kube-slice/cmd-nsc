@@ -319,7 +319,7 @@ func handlensmtask(parentCtx context.Context, clientConfig nscClient) error {
 			}),
 			// Must sit after the mechanisms client, which overwrites the kernel mechanism's
 			// netns with our own, and before sendfd, which turns that URL into an fd.
-			NewNetNSPinClient(netNSURLForPin),
+			NewNetNSPinClient(clientConfig.inodeUrl),
 			sendfd.NewClient(),
 			dnsClient,
 			excludedprefixes.NewClient(excludedprefixes.WithAwarenessGroups(c.AwarenessGroups)),
