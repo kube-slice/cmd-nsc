@@ -50,15 +50,21 @@ func resolveNetNSFileURL(inodeURL string) (string, error) {
 
 	// A running pod always has a process in its namespace, so procfs answers first and is the
 	// path the forwarder resolves identically, since it shares the host PID namespace.
-	if pid, err := findPIDByNetNSInode(ino); err == nil {
+	pid, procErr := findPIDByNetNSInode(ino)
+	if procErr == nil {
 		return (&url.URL{Scheme: "file", Path: fmt.Sprintf("/proc/%d/ns/net", pid)}).String(), nil
-	} else if !errors.Is(err, errNetNSNotFound) {
-		return "", err
+	}
+	if !errors.Is(procErr, errNetNSNotFound) && !errors.Is(procErr, errNetNSPermission) {
+		return "", procErr
 	}
 
 	// Fall back to a namespace pinned by the runtime or CNI.
 	if path, err := findPinnedNetNSByInode(ino); err == nil {
 		return (&url.URL{Scheme: "file", Path: path}).String(), nil
+	}
+
+	if errors.Is(procErr, errNetNSPermission) {
+		return "", fmt.Errorf("cannot resolve netns inode %d: %w", ino, procErr)
 	}
 
 	return "", fmt.Errorf("no network namespace with inode %d found under %s or %v; "+
@@ -89,14 +95,22 @@ func findPIDByNetNSInode(ino uint64) (int, error) {
 		return 0, fmt.Errorf("reading %s: %w", procPath, err)
 	}
 
+	var scanned, denied int
 	for _, e := range entries {
 		pid, err := strconv.Atoi(e.Name())
 		if err != nil {
 			continue // not a pid directory
 		}
+		scanned++
 		info, err := os.Stat(filepath.Join(procPath, e.Name(), "ns", "net"))
 		if err != nil {
-			continue // process exited, or not ours to read
+			// A process that exited between listing and stat is ordinary. Permission denied is
+			// not: it means we can see the process but not its namespace, and the namespace we
+			// are looking for may be one of those we were refused.
+			if os.IsPermission(err) {
+				denied++
+			}
+			continue
 		}
 		stat, ok := info.Sys().(*syscall.Stat_t)
 		if !ok {
@@ -107,10 +121,23 @@ func findPIDByNetNSInode(ino uint64) (int, error) {
 		}
 	}
 
+	// Being refused most of what we can see is the signature of a missing capability rather than
+	// a genuinely absent namespace, and it is worth saying so plainly: the symptom otherwise
+	// looks identical to hostPID not being set at all.
+	if denied > 0 && denied >= scanned/2 {
+		return 0, fmt.Errorf(
+			"could not read the network namespace of %d of the %d processes visible in %s: %w; "+
+				"SYS_PTRACE is required to read /proc/<pid>/ns/net of processes in other pods",
+			denied, scanned, procPath, errNetNSPermission)
+	}
+
 	return 0, errNetNSNotFound
 }
 
 var errNetNSNotFound = errors.New("no process found with a matching network namespace")
+
+// errNetNSPermission indicates the namespaces exist but we are not allowed to read them.
+var errNetNSPermission = errors.New("permission denied reading network namespaces")
 
 // findPinnedNetNSByInode looks for a network namespace pinned as a bind mount. Runtimes and CNI
 // plugins pin namespaces so they outlive the process that created them, and a sandbox whose

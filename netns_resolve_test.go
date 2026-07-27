@@ -104,3 +104,40 @@ func TestResolveFindsPinnedNetNS(t *testing.T) {
 		t.Errorf("resolved to %q, want %q", got, "file://"+pinned)
 	}
 }
+
+// Being able to see processes but not read their namespaces is what a missing SYS_PTRACE looks
+// like, and it must not be reported as "namespace not found" -- that sends the operator after
+// hostPID, which is already correct.
+func TestResolveDistinguishesPermissionDenialFromAbsence(t *testing.T) {
+	dir := t.TempDir()
+	old := procPath
+	procPath = dir
+	defer func() { procPath = old }()
+
+	// Processes we can list but whose ns/net we cannot stat.
+	for _, pid := range []string{"101", "102", "103", "104"} {
+		nsDir := filepath.Join(dir, pid, "ns")
+		if err := os.MkdirAll(nsDir, 0o755); err != nil {
+			t.Fatalf("fixture: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(nsDir, "net"), nil, 0o600); err != nil {
+			t.Fatalf("fixture: %v", err)
+		}
+		if err := os.Chmod(nsDir, 0o000); err != nil {
+			t.Fatalf("fixture: %v", err)
+		}
+		defer func(d string) { _ = os.Chmod(d, 0o755) }(nsDir)
+	}
+
+	oldDirs := netnsBindDirs
+	netnsBindDirs = []string{filepath.Join(dir, "no-such-pin-dir")}
+	defer func() { netnsBindDirs = oldDirs }()
+
+	_, err := resolveNetNSFileURL("inode://4/4026533855")
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if !strings.Contains(err.Error(), "SYS_PTRACE") {
+		t.Errorf("error should point at SYS_PTRACE, got: %v", err)
+	}
+}
