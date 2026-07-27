@@ -27,8 +27,6 @@ import (
 	"bufio"
 	"context"
 	"crypto/md5"
-	"crypto/rand"
-	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -194,7 +192,7 @@ func checkPodNetworkConnectivity(endpoint string) error {
 
 	return err
 }
-func handlensmtask(parentCtx context.Context, clientConfig nscClient) {
+func handlensmtask(parentCtx context.Context, clientConfig nscClient) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	// ********************************************************************************
@@ -212,10 +210,10 @@ func handlensmtask(parentCtx context.Context, clientConfig nscClient) {
 	// ********************************************************************************
 	c := &config.Config{}
 	if err := envconfig.Usage("nsm", c); err != nil {
-		logger.Fatal(err)
+		return fmt.Errorf("error printing usage for rootConf: %w", err)
 	}
 	if err := envconfig.Process("nsm", c); err != nil {
-		logger.Fatalf("error processing rootConf from env: %+v", err)
+		return fmt.Errorf("error processing rootConf from env: %w", err)
 	}
 	c.Name = clientConfig.podName
 	// set network service
@@ -223,7 +221,7 @@ func handlensmtask(parentCtx context.Context, clientConfig nscClient) {
 	c.NetworkServices = []url.URL{*nsURL}
 	level, err := logrus.ParseLevel(c.LogLevel)
 	if err != nil {
-		logrus.Fatalf("invalid log level %s", c.LogLevel)
+		return fmt.Errorf("invalid log level %s", c.LogLevel)
 	}
 	logrus.SetLevel(level)
 
@@ -233,7 +231,7 @@ func handlensmtask(parentCtx context.Context, clientConfig nscClient) {
 	fmt.Println("nsm_url: ", c.ConnectTo.String())
 	resolvedHost, err := resolveNsmConnectURL(ctx, &c.ConnectTo)
 	if err != nil {
-		logrus.Fatalf("error resolving nsm connect host: %v, err: %v", c.ConnectTo, err)
+		return fmt.Errorf("error resolving nsm connect host %v: %w", c.ConnectTo, err)
 	}
 	c.ConnectTo.Host = resolvedHost
 	logger.Infof("rootConf: %+v", c)
@@ -248,7 +246,7 @@ func handlensmtask(parentCtx context.Context, clientConfig nscClient) {
 	// before attempting to connect to the nsmgr.
 	err = checkPodNetworkConnectivity(resolvedHost)
 	if err != nil {
-		logrus.Fatalf("cannot connect to nsmgr over the pod network. host: %v, err: %v", resolvedHost, err)
+		return fmt.Errorf("cannot connect to nsmgr over the pod network, host %v: %w", resolvedHost, err)
 	}
 
 	// ********************************************************************************
@@ -346,7 +344,7 @@ func handlensmtask(parentCtx context.Context, clientConfig nscClient) {
 	logger.Infof("NSC: Connecting to Network Service Manager %v", c.ConnectTo.String())
 	cc, err := grpc.DialContext(dialCtx, grpcutils.URLToTarget(&c.ConnectTo), dialOptions...)
 	if err != nil {
-		logger.Fatalf("failed dial to NSMgr: %v", err.Error())
+		return fmt.Errorf("failed dial to NSMgr: %w", err)
 	}
 
 	monitorClient := networkservice.NewMonitorConnectionClient(cc)
@@ -360,7 +358,7 @@ func handlensmtask(parentCtx context.Context, clientConfig nscClient) {
 		fmt.Println("****************************************")
 		fmt.Println(strings.ToUpper(u.Scheme))
 		fmt.Println("****************************************")
-		id := fmt.Sprintf("%s-%d-%d-%s", c.Name, clientConfig.count, i, shortRandomSuffix())
+		id := connectionID(clientConfig, i)
 		var monitoredConnections map[string]*networkservice.Connection
 		monitorCtx, cancelMonitor := context.WithTimeout(signalCtx, c.RequestTimeout)
 		defer cancelMonitor()
@@ -373,7 +371,7 @@ func handlensmtask(parentCtx context.Context, clientConfig nscClient) {
 			},
 		})
 		if err != nil {
-			logger.Fatal("error from monitorConnectionClient ", err.Error())
+			return fmt.Errorf("error from monitorConnectionClient: %w", err)
 		}
 
 		event, err := stream.Recv()
@@ -432,16 +430,17 @@ func handlensmtask(parentCtx context.Context, clientConfig nscClient) {
 	// Wait for cancel event to terminate
 	<-signalCtx.Done()
 	fmt.Println("signalctx cancelled")
+	return nil
 }
 
-func shortRandomSuffix() string {
-	b := make([]byte, 6)
-	_, err := rand.Read(b)
-	if err != nil {
-		// Very rare fallback — use timestamp + pid
-		return fmt.Sprintf("t%x", time.Now().UnixNano()^(int64(os.Getpid())<<32))
-	}
-	return base64.RawURLEncoding.EncodeToString(b)[:8]
+// connectionID builds the NSM connection id for a client.
+//
+// It must stay identical across reconnects for the same pod and network service: NSM heals a
+// connection by id, so a fresh id on every attempt makes the MonitorConnections lookup below
+// miss, and every reconnect then builds a brand new connection -- allocating a new overlay
+// address and stranding the previous connection's veth on the vl3 router.
+func connectionID(clientConfig nscClient, idx int) string {
+	return fmt.Sprintf("%s-%s-%d", clientConfig.namespace, clientConfig.podName, idx)
 }
 
 func main() {
@@ -509,8 +508,14 @@ func (s *server) ProcessPod(ctx context.Context, req *nscpb.PodRequest) (*nscpb.
 	fmt.Println("Processing pod:", clientSpec.podName, clientSpec.namespace, clientSpec.nodeName)
 	fmt.Println("NetworkService: ", clientSpec.networkService)
 	fmt.Println("InodeURL: ", clientSpec.inodeUrl)
-	// Call your NSM handling logic
-	handlensmtask(ctx, clientSpec)
+	// Call your NSM handling logic. A failure here belongs to this pod's request only: it is
+	// returned to the caller so it can retry, and must never take down the shared server and
+	// with it every other pod's connection on this node.
+	if err := handlensmtask(ctx, clientSpec); err != nil {
+		Logger := log.FromContext(ctx)
+		Logger.Errorf("failed to set up NSM connection for pod %s/%s: %v", clientSpec.namespace, clientSpec.podName, err)
+		return &nscpb.PodResponse{Status: "Failed to set up NSM connection"}, err
+	}
 
 	fmt.Println("Work done for pod", clientSpec.podName)
 	return &nscpb.PodResponse{Status: "Pod processed successfully"}, nil
