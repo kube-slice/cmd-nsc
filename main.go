@@ -283,6 +283,17 @@ func handlensmtask(parentCtx context.Context, clientConfig nscClient) error {
 		),
 	)
 
+	// The sidecar reports its pod's netns as an inode. Translate it once, before the chain is
+	// built, into a /proc path the forwarder can open -- see resolveNetNSFileURL for why the
+	// inode form cannot survive this deployment's TCP hops.
+	netNSURLForPin, err := resolveNetNSFileURL(clientConfig.inodeUrl)
+	if err != nil {
+		return fmt.Errorf("cannot locate netns for pod %s/%s from %q: %w",
+			clientConfig.namespace, clientConfig.podName, clientConfig.inodeUrl, err)
+	}
+	logger.Infof("pod %s/%s netns %s resolved to %s",
+		clientConfig.namespace, clientConfig.podName, clientConfig.inodeUrl, netNSURLForPin)
+
 	dnsClient := null.NewClient()
 
 	var healOptions = []heal.Option{heal.WithLivenessCheckInterval(c.LivenessCheckInterval),
@@ -308,7 +319,7 @@ func handlensmtask(parentCtx context.Context, clientConfig nscClient) error {
 			}),
 			// Must sit after the mechanisms client, which overwrites the kernel mechanism's
 			// netns with our own, and before sendfd, which turns that URL into an fd.
-			NewNetNSPinClient(clientConfig.inodeUrl),
+			NewNetNSPinClient(netNSURLForPin),
 			sendfd.NewClient(),
 			dnsClient,
 			excludedprefixes.NewClient(excludedprefixes.WithAwarenessGroups(c.AwarenessGroups)),
@@ -385,7 +396,7 @@ func handlensmtask(parentCtx context.Context, clientConfig nscClient) error {
 		}
 		cancelMonitor()
 		mech := u.Mechanism()
-		mech.Parameters["inodeURL"] = clientConfig.inodeUrl
+		mech.Parameters["inodeURL"] = netNSURLForPin
 		fmt.Println("####################################")
 		fmt.Println("machnism: ", mech)
 		// Construct a request
