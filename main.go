@@ -449,12 +449,18 @@ func handlensmtask(parentCtx context.Context, clientConfig nscClient) error {
 
 // connectionID builds the NSM connection id for a client.
 //
-// It must stay identical across reconnects for the same pod and network service: NSM heals a
-// connection by id, so a fresh id on every attempt makes the MonitorConnections lookup below
-// miss, and every reconnect then builds a brand new connection -- allocating a new overlay
-// address and stranding the previous connection's veth on the vl3 router.
+// The id deliberately changes on every attempt. A stable id would let NSM heal a connection in
+// place, which is what upstream does, but it does not work here: after a datapath is lost, nsmgr
+// answers a repeat request for a known id from its cache without driving the chain down to the
+// forwarder and the vl3 NSE. The reply says "successfully connected" and carries no IP context,
+// no interface is created, the watchdog sees no nsm0 and closes, and the next attempt is answered
+// from cache again -- a loop nothing breaks out of.
+//
+// Including the sidecar's retry count makes each attempt a new connection, which nsmgr drives all
+// the way through. The cost is a new overlay address per reconnect and a veth left behind on the
+// vl3 router for the previous one.
 func connectionID(clientConfig nscClient, idx int) string {
-	return fmt.Sprintf("%s-%s-%d", clientConfig.namespace, clientConfig.podName, idx)
+	return fmt.Sprintf("%s-%s-%d-%d", clientConfig.namespace, clientConfig.podName, clientConfig.count, idx)
 }
 
 func main() {

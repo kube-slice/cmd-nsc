@@ -2,25 +2,25 @@ package main
 
 import "testing"
 
-// NSM heals a connection by id. If the id changes between attempts, the MonitorConnections lookup
-// in handlensmtask cannot find the previous connection, so every reconnect builds a new one: the
-// client gets a fresh overlay address and the old connection's veth is stranded on the vl3 router.
-// That is the behaviour this test exists to prevent regressing.
-func TestConnectionIDIsStableAcrossReconnects(t *testing.T) {
+// Reusing an id after a datapath loss gets the request answered from nsmgr's cache without the
+// chain being driven to the forwarder, so no interface is ever created. Each attempt must be a
+// new connection.
+func TestConnectionIDChangesPerAttempt(t *testing.T) {
 	first := nscClient{podName: "pg-dcdr-dc-a-0", namespace: "demo", count: 0}
-	// Same pod, later reconnect: the sidecar increments RetryCount on every attempt.
 	later := nscClient{podName: "pg-dcdr-dc-a-0", namespace: "demo", count: 7}
 
-	if got, want := connectionID(later, 0), connectionID(first, 0); got != want {
-		t.Errorf("connection id changed across reconnects: %q != %q", got, want)
+	if connectionID(later, 0) == connectionID(first, 0) {
+		t.Errorf("connection id was reused across attempts: %q", connectionID(first, 0))
 	}
 }
 
-func TestConnectionIDIsStableWhenCalledRepeatedly(t *testing.T) {
-	c := nscClient{podName: "pg-dcdr-dc-a-0", namespace: "demo"}
+// Within a single attempt the id must not wobble: it is used for the monitor lookup and the
+// request itself.
+func TestConnectionIDIsStableWithinAnAttempt(t *testing.T) {
+	c := nscClient{podName: "pg-dcdr-dc-a-0", namespace: "demo", count: 3}
 
 	if a, b := connectionID(c, 0), connectionID(c, 0); a != b {
-		t.Errorf("connection id is not deterministic: %q != %q", a, b)
+		t.Errorf("connection id is not deterministic within an attempt: %q != %q", a, b)
 	}
 }
 
