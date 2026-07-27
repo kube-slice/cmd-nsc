@@ -306,6 +306,9 @@ func handlensmtask(parentCtx context.Context, clientConfig nscClient) error {
 				vfiomech.MECHANISM:   chain.NewNetworkServiceClient(vfio.NewClient()),
 				kernelmech.MECHANISM: chain.NewNetworkServiceClient(kernel.NewClient()),
 			}),
+			// Must sit after the mechanisms client, which overwrites the kernel mechanism's
+			// netns with our own, and before sendfd, which turns that URL into an fd.
+			NewNetNSPinClient(clientConfig.inodeUrl),
 			sendfd.NewClient(),
 			dnsClient,
 			excludedprefixes.NewClient(excludedprefixes.WithAwarenessGroups(c.AwarenessGroups)),
