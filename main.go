@@ -40,19 +40,16 @@ import (
 	vfiomech "github.com/networkservicemesh/api/pkg/api/networkservice/mechanisms/vfio"
 	"github.com/networkservicemesh/cmd-nsc/internal/config"
 	nscpb "github.com/networkservicemesh/cmd-nsc/pkg/nsc/generated/nsc"
-	kernelheal "github.com/networkservicemesh/sdk-kernel/pkg/kernel/tools/heal"
 	"github.com/networkservicemesh/sdk-sriov/pkg/networkservice/common/mechanisms/vfio"
 	sriovtoken "github.com/networkservicemesh/sdk-sriov/pkg/networkservice/common/token"
 	"github.com/networkservicemesh/sdk/pkg/networkservice/chains/client"
 	"github.com/networkservicemesh/sdk/pkg/networkservice/common/clientinfo"
 	"github.com/networkservicemesh/sdk/pkg/networkservice/common/excludedprefixes"
-	"github.com/networkservicemesh/sdk/pkg/networkservice/common/heal"
 	"github.com/networkservicemesh/sdk/pkg/networkservice/common/mechanisms"
 	"github.com/networkservicemesh/sdk/pkg/networkservice/common/mechanisms/kernel"
 	"github.com/networkservicemesh/sdk/pkg/networkservice/common/mechanisms/sendfd"
 	"github.com/networkservicemesh/sdk/pkg/networkservice/common/null"
 	"github.com/networkservicemesh/sdk/pkg/networkservice/common/retry"
-	"github.com/networkservicemesh/sdk/pkg/networkservice/common/upstreamrefresh"
 	"github.com/networkservicemesh/sdk/pkg/networkservice/core/chain"
 	"github.com/networkservicemesh/sdk/pkg/tools/grpcutils"
 	"github.com/networkservicemesh/sdk/pkg/tools/log"
@@ -287,22 +284,31 @@ func handlensmtask(parentCtx context.Context, clientConfig nscClient) {
 
 	dnsClient := null.NewClient()
 
-	var healOptions = []heal.Option{heal.WithLivenessCheckInterval(c.LivenessCheckInterval),
-		heal.WithLivenessCheckTimeout(c.LivenessCheckTimeout)}
-
-	if c.LivenessCheckEnabled {
-		healOptions = append(healOptions, heal.WithLivenessCheck(kernelheal.KernelLivenessCheck))
-	}
-
+	// We do not heal here, and that is deliberate.
+	//
+	// This process is a broker: it issues NSM requests on behalf of *other* pods,
+	// and the only thing that makes such a request land in the right place is the
+	// inodeURL of the caller's netns, which arrives fresh on every ProcessPod call.
+	//
+	// Heal does not re-run that handshake. It replays the mechanism stored on the
+	// connection -- and by the time it is stored, kernel.NewClient() has already
+	// overwritten inodeURL with our own netns (it calls SetNetNSURL unconditionally,
+	// and NetNSURL and InodeURL are the same map key). So every heal attempt rebuilds
+	// the application pod's interface inside *this* pod instead, which is where the
+	// stray nsm0 and the pile of dead veths come from.
+	//
+	// Recovery belongs to the client sidecar: when it sees its connection go away it
+	// calls ProcessPod again, and that path re-resolves the target netns by
+	// construction. upstreamrefresh is dropped for the same reason -- it is a second
+	// internally-triggered replay of the same stale mechanism.
 	nsmClient := client.NewClient(ctx,
 		client.WithClientURL(&c.ConnectTo),
 		client.WithName(c.Name),
 		//client.WithAuthorizeClient(authorize.NewClient(authorize.Any())),
-		client.WithHealClient(heal.NewClient(ctx, healOptions...)),
+		client.WithHealClient(null.NewClient()),
 		client.WithAdditionalFunctionality(
 			//ensureexpires.NewClient(3*time.Minute),
 			clientinfo.NewClient(),
-			upstreamrefresh.NewClient(ctx),
 			sriovtoken.NewClient(),
 			mechanisms.NewClient(map[string]networkservice.NetworkServiceClient{
 				vfiomech.MECHANISM:   chain.NewNetworkServiceClient(vfio.NewClient()),
