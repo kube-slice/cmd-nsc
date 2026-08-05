@@ -45,6 +45,7 @@ import (
 	"github.com/networkservicemesh/sdk/pkg/networkservice/chains/client"
 	"github.com/networkservicemesh/sdk/pkg/networkservice/common/clientinfo"
 	"github.com/networkservicemesh/sdk/pkg/networkservice/common/excludedprefixes"
+	"github.com/networkservicemesh/sdk/pkg/networkservice/common/heal"
 	"github.com/networkservicemesh/sdk/pkg/networkservice/common/mechanisms"
 	"github.com/networkservicemesh/sdk/pkg/networkservice/common/mechanisms/kernel"
 	"github.com/networkservicemesh/sdk/pkg/networkservice/common/mechanisms/sendfd"
@@ -277,6 +278,15 @@ func handlensmtask(parentCtx context.Context, clientConfig nscClient) error {
 	if err := envconfig.Process("nsm", c); err != nil {
 		return fmt.Errorf("processing nsm config from env: %w", err)
 	}
+	ownNetNS, err := OwnNetNSInodeURL()
+	if err != nil {
+		return err
+	}
+	if sameNetNS(clientConfig.inodeUrl, ownNetNS) {
+		return fmt.Errorf("pod %v asked for an interface in the broker's own network namespace (%v)",
+			clientConfig.podName, clientConfig.inodeUrl)
+	}
+
 	c.Name = clientConfig.podName
 	// set network service
 	nsURL, err := url.Parse(clientConfig.networkService)
@@ -333,35 +343,47 @@ func handlensmtask(parentCtx context.Context, clientConfig nscClient) error {
 
 	dnsClient := null.NewClient()
 
-	// We do not heal here, and that is deliberate.
+	// Heal is on, and it repairs the application pod's connection rather than
+	// building a copy of it in here.
 	//
-	// This process is a broker: it issues NSM requests on behalf of *other* pods,
-	// and the only thing that makes such a request land in the right place is the
-	// inodeURL of the caller's netns, which arrives fresh on every ProcessPod call.
+	// It used to do the latter. Heal replays the request that begin stored,
+	// and by the time begin stores it kernel.NewClient() has overwritten the
+	// mechanism's netns with this process's own (SetNetNSURL is unconditional,
+	// and NetNSURL and InodeURL are the same map key). Replaying that rebuilt
+	// the pod's interface inside the broker: a stray nsm0 holding an overlay
+	// address, and a dead veth per attempt.
 	//
-	// Heal does not re-run that handshake. It replays the mechanism stored on the
-	// connection -- and by the time it is stored, kernel.NewClient() has already
-	// overwritten inodeURL with our own netns (it calls SetNetNSURL unconditionally,
-	// and NetNSURL and InodeURL are the same map key). So every heal attempt rebuilds
-	// the application pod's interface inside *this* pod instead, which is where the
-	// stray nsm0 and the pile of dead veths come from.
+	// NewNetNSClient below now runs immediately after the kernel client and
+	// re-asserts the pod's namespace on every request that leaves this chain,
+	// replays included, and refuses outright to send a request that would
+	// target this process. Recovery in place is worth having: the alternative
+	// is the sidecar noticing the interface is gone and asking for a whole new
+	// connection, which costs a teardown, a new address, and seconds of
+	// downtime for a break heal can repair.
 	//
-	// Recovery belongs to the client sidecar: when it sees its connection go away it
-	// calls ProcessPod again, and that path re-resolves the target netns by
-	// construction. upstreamrefresh is dropped for the same reason -- it is a second
-	// internally-triggered replay of the same stale mechanism.
+	// The liveness check stays off. It probes the datapath from whichever netns
+	// the process runs in, which here is the broker's, so it would report on a
+	// connection nobody is using. Heal reacts to the connection monitor
+	// instead, which is namespace independent.
+	//
+	// upstreamrefresh stays out: it is a second internally triggered replay and
+	// nothing needs it.
 	nsmClient := client.NewClient(ctx,
 		client.WithClientURL(&c.ConnectTo),
 		client.WithName(c.Name),
 		//client.WithAuthorizeClient(authorize.NewClient(authorize.Any())),
-		client.WithHealClient(null.NewClient()),
+		client.WithHealClient(heal.NewClient(ctx)),
 		client.WithAdditionalFunctionality(
 			//ensureexpires.NewClient(3*time.Minute),
 			clientinfo.NewClient(),
 			sriovtoken.NewClient(),
 			mechanisms.NewClient(map[string]networkservice.NetworkServiceClient{
-				vfiomech.MECHANISM:   chain.NewNetworkServiceClient(vfio.NewClient()),
-				kernelmech.MECHANISM: chain.NewNetworkServiceClient(kernel.NewClient()),
+				vfiomech.MECHANISM: chain.NewNetworkServiceClient(vfio.NewClient()),
+				kernelmech.MECHANISM: chain.NewNetworkServiceClient(
+					kernel.NewClient(),
+					// after the clobber, before sendfd reads the value
+					NewNetNSClient(clientConfig.inodeUrl, ownNetNS),
+				),
 			}),
 			sendfd.NewClient(),
 			dnsClient,
