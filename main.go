@@ -60,6 +60,8 @@ import (
 	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/keepalive"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
@@ -68,6 +70,7 @@ import (
 	"os"
 	"os/signal"
 	"regexp"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"sync"
@@ -142,6 +145,24 @@ type nscClient struct {
 	networkService string
 	inodeUrl       string
 	count          int32
+}
+
+// validateNetworkService rejects a URL that nsurl cannot turn into a usable
+// mechanism. Mechanism() only allocates its Parameters map when the path has
+// an interface name, so "kernel://vl3-service-slice" (no /nsm0) yields a nil
+// map and the first parameter write panics. As a sidecar that panic killed
+// the one pod that was misconfigured; here the value arrives over gRPC from
+// any pod on the node and the panic would kill the broker, so every pod on
+// the node would lose its datapath -- repeatedly, because the offending pod
+// retries every second.
+func validateNetworkService(nsURL *url.URL) error {
+	if nsURL.Scheme == "" || nsURL.Host == "" {
+		return fmt.Errorf("network service %q needs a scheme and a service name", nsURL.String())
+	}
+	if (*nsurl.NSURL)(nsURL).Mechanism().GetParameters() == nil {
+		return fmt.Errorf("network service %q has no interface name (expected e.g. kernel://service/nsm0)", nsURL.String())
+	}
+	return nil
 }
 
 func getResolverAddress() (string, error) {
@@ -231,26 +252,6 @@ func getNsmgrNodeLocalServiceName(nodeName string) string {
 	return "nsm-" + hex.EncodeToString(nodeNameHash[:])
 }
 
-// Checks if a successful connection can be made to the provided endpoint.
-func checkPodNetworkConnectivity(endpoint string) error {
-	var d net.Dialer
-	var err error
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-	defer cancel()
-	// Wait and retry if the connection attempt fails
-	for i := 0; i < 4; i++ {
-		conn, errN := d.DialContext(ctx, "tcp", endpoint)
-		if errN == nil {
-			conn.Close()
-			return nil
-		}
-		err = errN
-		time.Sleep(15 * time.Second)
-	}
-
-	return err
-}
-
 // handlensmtask brings up one pod's connection and holds it until the pod's
 // sidecar goes away. Every failure is returned rather than fatal: this
 // process serves every pod on the node, so exiting over one pod's problem
@@ -278,7 +279,13 @@ func handlensmtask(parentCtx context.Context, clientConfig nscClient) error {
 	}
 	c.Name = clientConfig.podName
 	// set network service
-	nsURL, _ := url.Parse(clientConfig.networkService)
+	nsURL, err := url.Parse(clientConfig.networkService)
+	if err != nil {
+		return fmt.Errorf("parsing network service %q: %w", clientConfig.networkService, err)
+	}
+	if err := validateNetworkService(nsURL); err != nil {
+		return err
+	}
 	c.NetworkServices = []url.URL{*nsURL}
 	// TODO: Remove this once internalTrafficPolicyi=Local for the nsmgr service works reliably.
 	c.ConnectTo = url.URL{Scheme: "tcp", Host: getNsmgrNodeLocalServiceName(clientConfig.nodeName) + ".kubeslice-system.svc.cluster.local:5001"}
@@ -299,10 +306,6 @@ func handlensmtask(parentCtx context.Context, clientConfig nscClient) error {
 	// that any other container in the pod cannot make network connections to the outside world until the istio-proxy is ready.
 	// This causes the cmd-nsc to crashloop trying to reach nsmgr over tcp. So we need to check if the pod network is operational
 	// before attempting to connect to the nsmgr.
-	err = checkPodNetworkConnectivity(resolvedHost)
-	if err != nil {
-		return fmt.Errorf("connecting to nsmgr over the pod network at %v: %w", resolvedHost, err)
-	}
 
 	// Open Telemetry is initialised once in main(). Doing it here created a
 	// span exporter, a metric exporter and their goroutines per pod attach,
@@ -373,14 +376,10 @@ func handlensmtask(parentCtx context.Context, clientConfig nscClient) error {
 	// ********************************************************************************
 	// Configure signal handling context
 	// ********************************************************************************
-	signalCtx, cancelSignalCtx := signal.NotifyContext(
-		ctx,
-		os.Interrupt,
-		// More Linux signals here
-		syscall.SIGHUP,
-		syscall.SIGTERM,
-		syscall.SIGQUIT,
-	)
+	// Signals are handled once, in main(). Registering a handler per pod made
+	// the process swallow SIGTERM for as long as any session was live, which
+	// is always, so the broker could only ever be SIGKILLed.
+	signalCtx, cancelSignalCtx := context.WithCancel(ctx)
 	defer cancelSignalCtx()
 
 	go func() {
@@ -499,7 +498,10 @@ func handlensmtask(parentCtx context.Context, clientConfig nscClient) error {
 
 		resp, err := nsmClient.Request(ctx, request)
 		if err != nil {
-			logger.Errorf("failed connect to NSMgr: %v", err.Error())
+			// Returning lets the pod's sidecar ask again straight away
+			// instead of waiting for its 10s interface watchdog, and stops
+			// this handler parking on a session that has no datapath.
+			return fmt.Errorf("requesting connection for pod %v: %w", c.Name, err)
 		}
 
 		defer func() {
@@ -625,30 +627,58 @@ func main() {
 	if err != nil {
 		Logger.Fatalf("failed to listen: %v", err.Error())
 	}
-	grpcServer := grpc.NewServer()
+	// A panic in one pod's handler must not take the datapath away from every
+	// pod on the node, and a caller that disappears without closing its TCP
+	// connection must be noticed in seconds rather than in grpc-go's default
+	// two hours.
+	grpcServer := grpc.NewServer(
+		grpc.KeepaliveParams(keepalive.ServerParameters{
+			Time:    20 * time.Second,
+			Timeout: 10 * time.Second,
+		}),
+		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
+			MinTime:             10 * time.Second,
+			PermitWithoutStream: true,
+		}),
+		grpc.UnaryInterceptor(recoverPanics),
+	)
 	nscpb.RegisterNSCServiceServer(grpcServer, &server{
 		clientset: clientset,
 		sessions:  make(map[string]*podSession),
 	})
+	signalCtx, stopSignals := signal.NotifyContext(context.Background(),
+		os.Interrupt, syscall.SIGHUP, syscall.SIGTERM, syscall.SIGQUIT)
+	defer stopSignals()
+	go func() {
+		<-signalCtx.Done()
+		Logger.Infof("shutting down")
+		grpcServer.GracefulStop()
+	}()
+
 	fmt.Println("starting server at 50052")
 	if err := grpcServer.Serve(lis); err != nil {
 		Logger.Fatalf("failed to serve: %v", err.Error())
 	}
 }
 
-func podHasLabel(podName string, namespace string) (bool, error) {
+// recoverPanics keeps one pod's request from killing the process. Anything
+// that panics here would otherwise unwind through grpc-go, which installs no
+// recovery of its own, and end the broker for every pod on the node.
+func recoverPanics(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (resp interface{}, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.FromContext(ctx).Errorf("panic in %v: %v\n%s", info.FullMethod, r, debug.Stack())
+			err = fmt.Errorf("internal error handling %v", info.FullMethod)
+		}
+	}()
+	return handler(ctx, req)
+}
+
+func (s *server) podHasLabel(podName string, namespace string) (bool, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	cfg, err := rest.InClusterConfig()
-	if err != nil {
-		return false, err
-	}
-	clientset, err := kubernetes.NewForConfig(cfg)
-	if err != nil {
-		return false, err
-	}
 
-	pod, err := clientset.CoreV1().Pods(namespace).Get(ctx, podName, metav1.GetOptions{})
+	pod, err := s.clientset.CoreV1().Pods(namespace).Get(ctx, podName, metav1.GetOptions{})
 	if err != nil {
 		return false, err
 	}
@@ -677,7 +707,7 @@ func (s *server) ProcessPod(ctx context.Context, req *nscpb.PodRequest) (*nscpb.
 			fmt.Errorf("pod %v is on node %v, this broker serves %v", clientSpec.podName, clientSpec.nodeName, ownNode)
 	}
 
-	check, err := podHasLabel(clientSpec.podName, clientSpec.namespace)
+	check, err := s.podHasLabel(clientSpec.podName, clientSpec.namespace)
 	if err != nil {
 		return &nscpb.PodResponse{Status: "Error checking pod labels"}, err
 	}
@@ -702,34 +732,37 @@ func (s *server) ProcessPod(ctx context.Context, req *nscpb.PodRequest) (*nscpb.
 	return &nscpb.PodResponse{Status: "Pod processed successfully"}, nil
 }
 
-func getPodIp(nodeName string) (string, error) {
+func (s *server) getPodIp(nodeName string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	cfg, err := rest.InClusterConfig()
-	if err != nil {
-		return "", err
-	}
-	clientset, err := kubernetes.NewForConfig(cfg)
-	if err != nil {
-		return "", err
-	}
 
 	ListOpts := metav1.ListOptions{
 		LabelSelector: "app=nsc-grpc-server",
 		FieldSelector: "spec.nodeName=" + nodeName,
 	}
-	pods, err := clientset.CoreV1().Pods("kubeslice-system").List(ctx, ListOpts)
+	pods, err := s.clientset.CoreV1().Pods("kubeslice-system").List(ctx, ListOpts)
 	if err != nil {
 		return "", err
 	}
 	for _, pod := range pods.Items {
-		if pod.Status.PodIP != "" {
-			return pod.Status.PodIP + ":50052", nil
+		if pod.Status.PodIP == "" || pod.DeletionTimestamp != nil {
+			continue
 		}
+		ready := false
+		for _, condition := range pod.Status.Conditions {
+			if condition.Type == corev1.PodReady && condition.Status == corev1.ConditionTrue {
+				ready = true
+				break
+			}
+		}
+		if !ready {
+			continue
+		}
+		return pod.Status.PodIP + ":50052", nil
 	}
 	return "", fmt.Errorf("no pod with label app=nsc-grpc-server found on node %s", nodeName)
 }
 func (s *server) DiscoverServer(ctx context.Context, req *nscpb.ClientNode) (*nscpb.ServerAddr, error) {
-	serverAddr, err := getPodIp(req.NodeName)
+	serverAddr, err := s.getPodIp(req.NodeName)
 	return &nscpb.ServerAddr{Server_Ip: serverAddr}, err
 }

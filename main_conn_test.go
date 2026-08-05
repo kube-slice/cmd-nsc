@@ -3,12 +3,14 @@
 package main
 
 import (
+	"net/url"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/networkservicemesh/api/pkg/api/networkservice"
 	kernelmech "github.com/networkservicemesh/api/pkg/api/networkservice/mechanisms/kernel"
+	"github.com/networkservicemesh/sdk/pkg/tools/nsurl"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
@@ -100,4 +102,46 @@ func TestConnectionsForPod_UnlabelledFallsBackToID(t *testing.T) {
 	if got := connectionsForPod(conns, "pg-dcdr-dc-b-1", kernelmech.MECHANISM); len(got) != 1 {
 		t.Fatalf("got %+v, want the unlabelled connection matched by id", got)
 	}
+}
+
+// A pod may send a network service URL that nsurl cannot build a mechanism
+// from. Before validation the first parameter write panicked on a nil map,
+// and since grpc-go installs no recovery that panic ended the broker for
+// every pod on the node -- repeatedly, because the offending pod retries
+// every second.
+func TestValidateNetworkService(t *testing.T) {
+	for _, tc := range []struct {
+		raw     string
+		wantErr bool
+	}{
+		{"kernel://vl3-service-slice/nsm0", false},
+		{"kernel://vl3-service-slice", true}, // no interface name: nil Parameters
+		{"", true},
+		{"vl3-service-slice", true},
+		{"kernel://", true},
+	} {
+		u, err := url.Parse(tc.raw)
+		if err != nil {
+			if !tc.wantErr {
+				t.Errorf("%q: unexpected parse error %v", tc.raw, err)
+			}
+			continue
+		}
+		if gotErr := validateNetworkService(u) != nil; gotErr != tc.wantErr {
+			t.Errorf("validateNetworkService(%q) error = %v, want error = %v", tc.raw, gotErr, tc.wantErr)
+		}
+	}
+}
+
+// The accepted form must survive the parameter write that used to panic.
+func TestValidatedNetworkServiceAcceptsParameters(t *testing.T) {
+	u, err := url.Parse("kernel://vl3-service-slice/nsm0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validateNetworkService(u); err != nil {
+		t.Fatalf("validateNetworkService: %v", err)
+	}
+	mech := (*nsurl.NSURL)(u).Mechanism()
+	mech.Parameters["inodeURL"] = "inode://4/12345" // panicked before validation
 }
