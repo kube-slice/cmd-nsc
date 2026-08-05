@@ -496,7 +496,13 @@ func handlensmtask(parentCtx context.Context, clientConfig nscClient) error {
 		}
 		closing.Wait()
 
-		resp, err := nsmClient.Request(ctx, request)
+		// signalCtx, not ctx: this request must die with the pod that asked
+		// for it. ctx is rooted at context.Background(), so when the pod is
+		// deleted and its sidecar's RPC ends, a request issued on ctx keeps
+		// being retried -- up to maxRetry times the request timeout -- for a
+		// pod that no longer exists, against an endpoint that keeps
+		// cancelling it.
+		resp, err := nsmClient.Request(signalCtx, request)
 		if err != nil {
 			// Returning lets the pod's sidecar ask again straight away
 			// instead of waiting for its 10s interface watchdog, and stops
