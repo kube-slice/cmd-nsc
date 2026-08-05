@@ -1,0 +1,103 @@
+//go:build linux
+
+package main
+
+import (
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/networkservicemesh/api/pkg/api/networkservice"
+	kernelmech "github.com/networkservicemesh/api/pkg/api/networkservice/mechanisms/kernel"
+	"google.golang.org/protobuf/types/known/timestamppb"
+)
+
+func conn(id string, index uint32, mechType string, expires time.Time) *networkservice.Connection {
+	return withPodLabel(id, index, mechType, expires, podNameOf(id))
+}
+
+// podNameOf strips the "-<retry>-<index>-<suffix>" tail the client appends.
+func podNameOf(id string) string {
+	parts := strings.Split(id, "-")
+	if len(parts) < 4 {
+		return id
+	}
+	return strings.Join(parts[:len(parts)-3], "-")
+}
+
+func withPodLabel(id string, index uint32, mechType string, expires time.Time, podName string) *networkservice.Connection {
+	return &networkservice.Connection{
+		Id:        id,
+		Labels:    map[string]string{"podName": podName},
+		Mechanism: &networkservice.Mechanism{Type: mechType},
+		Path: &networkservice.Path{
+			Index: index,
+			PathSegments: []*networkservice.PathSegment{
+				{Id: id, Expires: timestamppb.New(expires)},
+			},
+		},
+	}
+}
+
+// A pod that reconnects gets a new id every time, so nsmgr can be holding
+// several connections for it at once. Every one of them must be found, so
+// they can be closed before the next connection is created; anything missed
+// stays registered, expires later, and takes the pod's live interface with
+// it when it is torn down.
+func TestConnectionsForPod(t *testing.T) {
+	now := time.Now()
+	pod := "pg-dcdr-dc-b-1"
+	conns := map[string]*networkservice.Connection{
+		"old":     conn(pod+"-1-0-AAAAAAAA", 1, kernelmech.MECHANISM, now.Add(2*time.Minute)),
+		"live":    conn(pod+"-2-0-BBBBBBBB", 1, kernelmech.MECHANISM, now.Add(9*time.Minute)),
+		"other":   conn("srvd-dc-b-2-1-0-CCCCCCCC", 1, kernelmech.MECHANISM, now.Add(9*time.Minute)),
+		"ourside": conn(pod+"-3-0-DDDDDDDD", 0, kernelmech.MECHANISM, now.Add(9*time.Minute)),
+		"vfio":    conn(pod+"-4-0-EEEEEEEE", 1, "VFIO", now.Add(9*time.Minute)),
+	}
+
+	got := connectionsForPod(conns, pod, kernelmech.MECHANISM)
+
+	if len(got) != 2 {
+		t.Fatalf("want the pod's 2 kernel connections at path index 1, got %d: %+v", len(got), got)
+	}
+	if got[0].GetId() != pod+"-2-0-BBBBBBBB" || got[1].GetId() != pod+"-1-0-AAAAAAAA" {
+		t.Errorf("got %q then %q, want most recently refreshed first",
+			got[0].GetId(), got[1].GetId())
+	}
+}
+
+// A pod attaching for the first time has nothing to adopt and nothing to close.
+func TestConnectionsForPod_NoneExisting(t *testing.T) {
+	got := connectionsForPod(map[string]*networkservice.Connection{}, "fresh-pod-0", kernelmech.MECHANISM)
+	if len(got) != 0 {
+		t.Fatalf("got %+v, want none", got)
+	}
+}
+
+// The id encoding is ambiguous: "srvd-dc-b-2-1-0-<suffix>" reads equally as
+// pod "srvd-dc-b-2" retry 1 or pod "srvd-dc-b" retry 2. The podName label
+// decides it, so one pod can never adopt another pod's datapath.
+func TestConnectionsForPod_LabelResolvesAmbiguousID(t *testing.T) {
+	now := time.Now()
+	conns := map[string]*networkservice.Connection{
+		"a": conn("srvd-dc-b-2-1-0-AAAAAAAA", 1, kernelmech.MECHANISM, now.Add(time.Minute)),
+	}
+
+	if got := connectionsForPod(conns, "srvd-dc-b", kernelmech.MECHANISM); len(got) != 0 {
+		t.Fatalf("got %+v, want none: srvd-dc-b must not claim srvd-dc-b-2's connection", got)
+	}
+	if got := connectionsForPod(conns, "srvd-dc-b-2", kernelmech.MECHANISM); len(got) != 1 {
+		t.Fatalf("got %+v, want the connection to be found by its own pod", got)
+	}
+}
+
+// Connections predating the label still resolve by id shape.
+func TestConnectionsForPod_UnlabelledFallsBackToID(t *testing.T) {
+	now := time.Now()
+	unlabelled := withPodLabel("pg-dcdr-dc-b-1-2-0-BBBBBBBB", 1, kernelmech.MECHANISM, now.Add(time.Minute), "")
+	conns := map[string]*networkservice.Connection{"a": unlabelled}
+
+	if got := connectionsForPod(conns, "pg-dcdr-dc-b-1", kernelmech.MECHANISM); len(got) != 1 {
+		t.Fatalf("got %+v, want the unlabelled connection matched by id", got)
+	}
+}

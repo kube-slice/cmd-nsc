@@ -67,7 +67,10 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"regexp"
+	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -75,7 +78,63 @@ import (
 type server struct {
 	nscpb.UnimplementedNSCServiceServer
 	clientset *kubernetes.Clientset
+
+	// One NSM session per pod at a time. A sidecar could never call twice
+	// concurrently for the same pod because it *was* the pod's only client;
+	// this broker serves every pod on the node, and its clients retry, so
+	// overlapping ProcessPod calls for one pod are routine. Two sessions for
+	// one pod mean two connections and two veths carrying the same pod name
+	// on the slice router, which is how a pod ends up shadowed by its own
+	// stale interface.
+	mu       sync.Mutex
+	sessions map[string]*podSession
 }
+
+type podSession struct {
+	cancel context.CancelFunc
+	done   chan struct{}
+}
+
+// takeOver stops any session already running for key and waits for it to
+// finish, then registers this one. The returned release function unregisters
+// it and wakes anything waiting.
+func (s *server) takeOver(key string, cancel context.CancelFunc) func() {
+	s.mu.Lock()
+	previous := s.sessions[key]
+	s.mu.Unlock()
+
+	if previous != nil {
+		previous.cancel()
+		select {
+		case <-previous.done:
+		case <-time.After(sessionHandoverTimeout):
+			log.FromContext(context.Background()).
+				Warnf("previous session for %v did not finish within %v, continuing", key, sessionHandoverTimeout)
+		}
+	}
+
+	current := &podSession{cancel: cancel, done: make(chan struct{})}
+	s.mu.Lock()
+	s.sessions[key] = current
+	s.mu.Unlock()
+
+	return func() {
+		s.mu.Lock()
+		if s.sessions[key] == current {
+			delete(s.sessions, key)
+		}
+		s.mu.Unlock()
+		close(current.done)
+	}
+}
+
+const (
+	sessionHandoverTimeout = 30 * time.Second
+	// staleCloseTimeout bounds a Close of a connection this pod no longer
+	// uses. The peer may be gone, in which case the Close never completes.
+	staleCloseTimeout = 10 * time.Second
+)
+
 type nscClient struct {
 	podName        string
 	nodeName       string
@@ -191,15 +250,18 @@ func checkPodNetworkConnectivity(endpoint string) error {
 
 	return err
 }
-func handlensmtask(parentCtx context.Context, clientConfig nscClient) {
+
+// handlensmtask brings up one pod's connection and holds it until the pod's
+// sidecar goes away. Every failure is returned rather than fatal: this
+// process serves every pod on the node, so exiting over one pod's problem
+// takes the datapath away from all the others.
+func handlensmtask(parentCtx context.Context, clientConfig nscClient) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	// ********************************************************************************
-	// Setup logger
-	// ********************************************************************************
-	log.EnableTracing(true)
-	logrus.Info("Starting NetworkServiceMesh Client ...")
-	logrus.SetFormatter(&nested.Formatter{})
+	// Logging and tracing are process wide and are configured once in main():
+	// this function runs per pod, and re-running the global setup on every
+	// attach both races with other pods and re-enables tracing they may have
+	// turned off.
 	ctx = log.WithLog(ctx, logruslogger.New(ctx, map[string]interface{}{"cmd": os.Args[:1]}))
 
 	logger := log.FromContext(ctx)
@@ -209,28 +271,22 @@ func handlensmtask(parentCtx context.Context, clientConfig nscClient) {
 	// ********************************************************************************
 	c := &config.Config{}
 	if err := envconfig.Usage("nsm", c); err != nil {
-		logger.Fatal(err)
+		return fmt.Errorf("reading nsm config usage: %w", err)
 	}
 	if err := envconfig.Process("nsm", c); err != nil {
-		logger.Fatalf("error processing rootConf from env: %+v", err)
+		return fmt.Errorf("processing nsm config from env: %w", err)
 	}
 	c.Name = clientConfig.podName
 	// set network service
 	nsURL, _ := url.Parse(clientConfig.networkService)
 	c.NetworkServices = []url.URL{*nsURL}
-	level, err := logrus.ParseLevel(c.LogLevel)
-	if err != nil {
-		logrus.Fatalf("invalid log level %s", c.LogLevel)
-	}
-	logrus.SetLevel(level)
-
 	// TODO: Remove this once internalTrafficPolicyi=Local for the nsmgr service works reliably.
 	c.ConnectTo = url.URL{Scheme: "tcp", Host: getNsmgrNodeLocalServiceName(clientConfig.nodeName) + ".kubeslice-system.svc.cluster.local:5001"}
 	// Resolve connect URL if the connection scheme is tcp or udp
 	fmt.Println("nsm_url: ", c.ConnectTo.String())
 	resolvedHost, err := resolveNsmConnectURL(ctx, &c.ConnectTo)
 	if err != nil {
-		logrus.Fatalf("error resolving nsm connect host: %v, err: %v", c.ConnectTo, err)
+		return fmt.Errorf("resolving nsm connect host %v: %w", c.ConnectTo.String(), err)
 	}
 	c.ConnectTo.Host = resolvedHost
 	logger.Infof("rootConf: %+v", c)
@@ -245,23 +301,13 @@ func handlensmtask(parentCtx context.Context, clientConfig nscClient) {
 	// before attempting to connect to the nsmgr.
 	err = checkPodNetworkConnectivity(resolvedHost)
 	if err != nil {
-		logrus.Fatalf("cannot connect to nsmgr over the pod network. host: %v, err: %v", resolvedHost, err)
+		return fmt.Errorf("connecting to nsmgr over the pod network at %v: %w", resolvedHost, err)
 	}
 
-	// ********************************************************************************
-	// Configure Open Telemetry
-	// ********************************************************************************
-	if opentelemetry.IsEnabled() {
-		collectorAddress := c.OpenTelemetryEndpoint
-		spanExporter := opentelemetry.InitSpanExporter(ctx, collectorAddress)
-		metricExporter := opentelemetry.InitOPTLMetricExporter(ctx, collectorAddress, 60*time.Second)
-		o := opentelemetry.Init(ctx, spanExporter, metricExporter, c.Name)
-		defer func() {
-			if err = o.Close(); err != nil {
-				logger.Error(err.Error())
-			}
-		}()
-	}
+	// Open Telemetry is initialised once in main(). Doing it here created a
+	// span exporter, a metric exporter and their goroutines per pod attach,
+	// none of which outlive a sidecar but all of which accumulate in a
+	// process that runs for the life of the node.
 	// ********************************************************************************
 	// Get a x509Source
 	// ********************************************************************************
@@ -352,8 +398,13 @@ func handlensmtask(parentCtx context.Context, clientConfig nscClient) {
 	logger.Infof("NSC: Connecting to Network Service Manager %v", c.ConnectTo.String())
 	cc, err := grpc.DialContext(dialCtx, grpcutils.URLToTarget(&c.ConnectTo), dialOptions...)
 	if err != nil {
-		logger.Fatalf("failed dial to NSMgr: %v", err.Error())
+		return fmt.Errorf("dialling NSMgr: %w", err)
 	}
+
+	// The broker is long lived and dials nsmgr once per pod attach, so this
+	// connection has to be released here; a process-lifetime leak of one
+	// ClientConn (and its goroutines) per attach exhausts file descriptors.
+	defer func() { _ = cc.Close() }()
 
 	monitorClient := networkservice.NewMonitorConnectionClient(cc)
 
@@ -371,15 +422,13 @@ func handlensmtask(parentCtx context.Context, clientConfig nscClient) {
 		monitorCtx, cancelMonitor := context.WithTimeout(signalCtx, c.RequestTimeout)
 		defer cancelMonitor()
 
-		stream, err := monitorClient.MonitorConnections(monitorCtx, &networkservice.MonitorScopeSelector{
-			PathSegments: []*networkservice.PathSegment{
-				{
-					Id: id,
-				},
-			},
-		})
+		// Select every connection nsmgr holds, not just the id we are about
+		// to create. That id carries a fresh random suffix, so selecting on
+		// it can only ever return an empty set, which is why this pod's
+		// previous connections were never found and never cleaned up.
+		stream, err := monitorClient.MonitorConnections(monitorCtx, &networkservice.MonitorScopeSelector{})
 		if err != nil {
-			logger.Fatal("error from monitorConnectionClient ", err.Error())
+			return fmt.Errorf("monitoring connections: %w", err)
 		}
 
 		event, err := stream.Recv()
@@ -409,15 +458,44 @@ func handlensmtask(parentCtx context.Context, clientConfig nscClient) {
 			},
 		}
 
-		for _, conn := range monitoredConnections {
-			path := conn.GetPath()
-			if path.Index == 1 && path.PathSegments[0].Id == id && conn.Mechanism.Type == u.Mechanism().Type {
-				request.Connection = conn
-				request.Connection.Path.Index = 0
-				request.Connection.Id = id
-				break
-			}
+		// Close whatever nsmgr still holds for this pod before asking for a
+		// new connection.
+		//
+		// Every attempt gets a fresh id on purpose, so the previous
+		// connection is never refreshed again by anyone. Left alone it stays
+		// registered until its token expires, and the teardown that follows
+		// removes nsm0 from the pod -- the same interface the new connection
+		// is using by then. The pod's sidecar sees the interface vanish,
+		// asks for another connection, strands that one in turn, and the
+		// mesh reconnects itself once per token lifetime forever.
+		//
+		// This has to happen before the Request below and not after: the new
+		// interface carries the same name in the same netns, so a Close that
+		// lands afterwards deletes the interface that was just created. The
+		// pod has no datapath at this point anyway, which is why its sidecar
+		// called us.
+		// Bounded and concurrent: the pod has no datapath while this runs, so
+		// a Close that hangs against an endpoint which is already gone must
+		// not hold the new connection back for the whole request timeout.
+		var closing sync.WaitGroup
+		for _, previous := range connectionsForPod(monitoredConnections, c.Name, u.Mechanism().Type) {
+			stale := previous.Clone()
+			stale.Id = stale.GetPath().GetPathSegments()[0].GetId()
+			stale.GetPath().Index = 0
+
+			closing.Add(1)
+			go func(stale *networkservice.Connection) {
+				defer closing.Done()
+				closeCtx, cancelStaleClose := context.WithTimeout(ctx, staleCloseTimeout)
+				defer cancelStaleClose()
+				if _, closeErr := nsmClient.Close(closeCtx, stale); closeErr != nil {
+					logger.Warnf("could not close previous connection %v of pod %v: %v", stale.Id, c.Name, closeErr)
+					return
+				}
+				logger.Infof("closed previous connection %v of pod %v", stale.Id, c.Name)
+			}(stale)
 		}
+		closing.Wait()
 
 		resp, err := nsmClient.Request(ctx, request)
 		if err != nil {
@@ -425,7 +503,7 @@ func handlensmtask(parentCtx context.Context, clientConfig nscClient) {
 		}
 
 		defer func() {
-			closeCtx, cancelClose := context.WithTimeout(ctx, 30*time.Second)
+			closeCtx, cancelClose := context.WithTimeout(ctx, staleCloseTimeout)
 			defer cancelClose()
 			_, _ = nsmClient.Close(closeCtx, resp)
 			logger.Infof("closed connection to %v", u.NetworkService())
@@ -438,6 +516,63 @@ func handlensmtask(parentCtx context.Context, clientConfig nscClient) {
 	// Wait for cancel event to terminate
 	<-signalCtx.Done()
 	fmt.Println("signalctx cancelled")
+	return nil
+}
+
+// connectionsForPod returns the connections nsmgr still holds for podName,
+// most recently refreshed first. They are all leftovers: a pod gets a fresh
+// connection id on every attempt, so none of them will ever be refreshed
+// again. Connection ids are built as
+// "<podName>-<retry>-<index>-<suffix>", so the pod name prefix identifies
+// every incarnation of this pod's session, including ones this process did
+// not create (for example before a broker restart).
+func connectionsForPod(conns map[string]*networkservice.Connection, podName, mechType string) []*networkservice.Connection {
+	var out []*networkservice.Connection
+	for _, conn := range conns {
+		path := conn.GetPath()
+		if path == nil || len(path.GetPathSegments()) == 0 || path.GetIndex() != 1 {
+			continue
+		}
+		if conn.GetMechanism().GetType() != mechType {
+			continue
+		}
+		if !belongsToPod(conn, podName) {
+			continue
+		}
+		out = append(out, conn)
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		return latestExpiry(out[i]).After(latestExpiry(out[j]))
+	})
+	return out
+}
+
+// belongsToPod reports whether a connection was created for podName.
+//
+// The podName label is authoritative: connection ids are
+// "<podName>-<retry>-<index>-<suffix>", and that encoding is ambiguous
+// (pod "srvd-dc-b" with retry 2 produces the same id shape as pod
+// "srvd-dc-b-2" with retry 1), so adopting on the id alone could hand one
+// pod's datapath to another. The id is only consulted when a connection
+// carries no label, where a wrong guess would at worst skip an adoption.
+func belongsToPod(conn *networkservice.Connection, podName string) bool {
+	if labelled, ok := conn.GetLabels()["podName"]; ok && labelled != "" {
+		return labelled == podName
+	}
+	rest, ok := strings.CutPrefix(conn.GetPath().GetPathSegments()[0].GetId(), podName+"-")
+	return ok && connIDTail.MatchString(rest)
+}
+
+var connIDTail = regexp.MustCompile(`^[0-9]+-[0-9]+-`)
+
+func latestExpiry(conn *networkservice.Connection) time.Time {
+	var newest time.Time
+	for _, segment := range conn.GetPath().GetPathSegments() {
+		if t := segment.GetExpires().AsTime(); t.After(newest) {
+			newest = t
+		}
+	}
+	return newest
 }
 
 func shortRandomSuffix() string {
@@ -451,6 +586,32 @@ func shortRandomSuffix() string {
 }
 
 func main() {
+	// Process wide setup, once (see handlensmtask).
+	log.EnableTracing(true)
+	logrus.SetFormatter(&nested.Formatter{})
+	logrus.Info("Starting NetworkServiceMesh Client ...")
+
+	rootConf := &config.Config{}
+	if err := envconfig.Process("nsm", rootConf); err == nil {
+		if level, levelErr := logrus.ParseLevel(rootConf.LogLevel); levelErr == nil {
+			logrus.SetLevel(level)
+		} else {
+			logrus.Warnf("invalid log level %s, keeping %s", rootConf.LogLevel, logrus.GetLevel())
+		}
+	}
+
+	if opentelemetry.IsEnabled() {
+		otelCtx := context.Background()
+		spanExporter := opentelemetry.InitSpanExporter(otelCtx, rootConf.OpenTelemetryEndpoint)
+		metricExporter := opentelemetry.InitOPTLMetricExporter(otelCtx, rootConf.OpenTelemetryEndpoint, 60*time.Second)
+		o := opentelemetry.Init(otelCtx, spanExporter, metricExporter, "nsc-grpc-server")
+		defer func() {
+			if closeErr := o.Close(); closeErr != nil {
+				logrus.Error(closeErr.Error())
+			}
+		}()
+	}
+
 	config, err := rest.InClusterConfig()
 	Logger := log.FromContext(context.Background())
 	if err != nil {
@@ -465,7 +626,10 @@ func main() {
 		Logger.Fatalf("failed to listen: %v", err.Error())
 	}
 	grpcServer := grpc.NewServer()
-	nscpb.RegisterNSCServiceServer(grpcServer, &server{clientset: clientset})
+	nscpb.RegisterNSCServiceServer(grpcServer, &server{
+		clientset: clientset,
+		sessions:  make(map[string]*podSession),
+	})
 	fmt.Println("starting server at 50052")
 	if err := grpcServer.Serve(lis); err != nil {
 		Logger.Fatalf("failed to serve: %v", err.Error())
@@ -505,6 +669,14 @@ func (s *server) ProcessPod(ctx context.Context, req *nscpb.PodRequest) (*nscpb.
 		inodeUrl:       req.InodeURL,
 		count:          req.RetryCount,
 	}
+	// This broker owns one node. Serving a pod from another node would create
+	// its interface against the wrong nsmgr, using a netns inode that means
+	// nothing here.
+	if ownNode := os.Getenv("MY_NODE_NAME"); ownNode != "" && clientSpec.nodeName != "" && clientSpec.nodeName != ownNode {
+		return &nscpb.PodResponse{Status: "Pod belongs to another node"},
+			fmt.Errorf("pod %v is on node %v, this broker serves %v", clientSpec.podName, clientSpec.nodeName, ownNode)
+	}
+
 	check, err := podHasLabel(clientSpec.podName, clientSpec.namespace)
 	if err != nil {
 		return &nscpb.PodResponse{Status: "Error checking pod labels"}, err
@@ -516,7 +688,15 @@ func (s *server) ProcessPod(ctx context.Context, req *nscpb.PodRequest) (*nscpb.
 	fmt.Println("NetworkService: ", clientSpec.networkService)
 	fmt.Println("InodeURL: ", clientSpec.inodeUrl)
 	// Call your NSM handling logic
-	handlensmtask(ctx, clientSpec)
+	sessionCtx, cancelSession := context.WithCancel(ctx)
+	defer cancelSession()
+	release := s.takeOver(clientSpec.namespace+"/"+clientSpec.podName, cancelSession)
+	defer release()
+
+	if err := handlensmtask(sessionCtx, clientSpec); err != nil {
+		fmt.Println("Failed to process pod", clientSpec.podName, err)
+		return &nscpb.PodResponse{Status: "Failed to set up NSM connection"}, err
+	}
 
 	fmt.Println("Work done for pod", clientSpec.podName)
 	return &nscpb.PodResponse{Status: "Pod processed successfully"}, nil
