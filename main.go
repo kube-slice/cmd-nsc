@@ -417,26 +417,6 @@ func handlensmtask(parentCtx context.Context, clientConfig nscClient) error {
 		fmt.Println(strings.ToUpper(u.Scheme))
 		fmt.Println("****************************************")
 		id := fmt.Sprintf("%s-%d-%d-%s", c.Name, clientConfig.count, i, shortRandomSuffix())
-		var monitoredConnections map[string]*networkservice.Connection
-		monitorCtx, cancelMonitor := context.WithTimeout(signalCtx, c.RequestTimeout)
-		defer cancelMonitor()
-
-		// Select every connection nsmgr holds, not just the id we are about
-		// to create. That id carries a fresh random suffix, so selecting on
-		// it can only ever return an empty set, which is why this pod's
-		// previous connections were never found and never cleaned up.
-		stream, err := monitorClient.MonitorConnections(monitorCtx, &networkservice.MonitorScopeSelector{})
-		if err != nil {
-			return fmt.Errorf("monitoring connections: %w", err)
-		}
-
-		event, err := stream.Recv()
-		if err != nil {
-			logger.Errorf("error from monitorConnection stream ", err.Error())
-		} else {
-			monitoredConnections = event.Connections
-		}
-		cancelMonitor()
 		mech := u.Mechanism()
 		mech.Parameters["inodeURL"] = clientConfig.inodeUrl
 		fmt.Println("####################################")
@@ -457,44 +437,23 @@ func handlensmtask(parentCtx context.Context, clientConfig nscClient) error {
 			},
 		}
 
-		// Close whatever nsmgr still holds for this pod before asking for a
-		// new connection.
+		// Close whatever the nsmgr still holds for this pod before asking for
+		// a new connection.
 		//
-		// Every attempt gets a fresh id on purpose, so the previous
-		// connection is never refreshed again by anyone. Left alone it stays
-		// registered until its token expires, and the teardown that follows
-		// removes nsm0 from the pod -- the same interface the new connection
-		// is using by then. The pod's sidecar sees the interface vanish,
-		// asks for another connection, strands that one in turn, and the
-		// mesh reconnects itself once per token lifetime forever.
+		// Every attempt gets a fresh id on purpose, so the connection the pod
+		// had a moment ago is never refreshed again by anyone. Left alone it
+		// stays registered until its token expires, and the teardown that
+		// follows removes nsm0 from the pod -- by then the interface belongs
+		// to the new connection. The pod's sidecar sees it vanish, asks for
+		// another connection, strands that one in turn, and the mesh
+		// reconnects itself once per token lifetime forever.
 		//
 		// This has to happen before the Request below and not after: the new
 		// interface carries the same name in the same netns, so a Close that
 		// lands afterwards deletes the interface that was just created. The
 		// pod has no datapath at this point anyway, which is why its sidecar
 		// called us.
-		// Bounded and concurrent: the pod has no datapath while this runs, so
-		// a Close that hangs against an endpoint which is already gone must
-		// not hold the new connection back for the whole request timeout.
-		var closing sync.WaitGroup
-		for _, previous := range connectionsForPod(monitoredConnections, c.Name) {
-			stale := previous.Clone()
-			stale.Id = stale.GetPath().GetPathSegments()[0].GetId()
-			stale.GetPath().Index = 0
-
-			closing.Add(1)
-			go func(stale *networkservice.Connection) {
-				defer closing.Done()
-				closeCtx, cancelStaleClose := context.WithTimeout(ctx, staleCloseTimeout)
-				defer cancelStaleClose()
-				if _, closeErr := nsmClient.Close(closeCtx, stale); closeErr != nil {
-					logger.Warnf("could not close previous connection %v of pod %v: %v", stale.Id, c.Name, closeErr)
-					return
-				}
-				logger.Infof("closed previous connection %v of pod %v", stale.Id, c.Name)
-			}(stale)
-		}
-		closing.Wait()
+		closeConnectionsForPod(ctx, nsmClient, monitorClient, c.Name, logger)
 
 		// signalCtx, not ctx: this request must die with the pod that asked
 		// for it. ctx is rooted at context.Background(), so when the pod is
@@ -511,10 +470,18 @@ func handlensmtask(parentCtx context.Context, clientConfig nscClient) error {
 		}
 
 		defer func() {
+			// The session is over: either the pod is gone or its sidecar is
+			// about to ask again. Leave nothing registered for it. Closing
+			// only the connection this session created would leave behind
+			// anything a failed Close left over earlier, and that leftover
+			// expires later and takes the next incarnation's interface with
+			// it.
 			closeCtx, cancelClose := context.WithTimeout(ctx, staleCloseTimeout)
-			defer cancelClose()
 			_, _ = nsmClient.Close(closeCtx, resp)
+			cancelClose()
 			logger.Infof("closed connection to %v", u.NetworkService())
+
+			closeConnectionsForPod(ctx, nsmClient, monitorClient, c.Name, logger)
 			cancel()
 		}()
 
@@ -525,6 +492,52 @@ func handlensmtask(parentCtx context.Context, clientConfig nscClient) error {
 	<-signalCtx.Done()
 	fmt.Println("signalctx cancelled")
 	return nil
+}
+
+// closeConnectionsForPod closes every connection the nsmgr still holds for
+// podName. Closes are bounded and concurrent: the peer of a connection the
+// pod no longer uses may be gone, in which case the Close never completes,
+// and nothing here is allowed to hold up the pod's next connection.
+func closeConnectionsForPod(
+	ctx context.Context,
+	nsmClient networkservice.NetworkServiceClient,
+	monitorClient networkservice.MonitorConnectionClient,
+	podName string,
+	logger log.Logger,
+) {
+	monitorCtx, cancelMonitor := context.WithTimeout(ctx, staleCloseTimeout)
+	defer cancelMonitor()
+
+	stream, err := monitorClient.MonitorConnections(monitorCtx, &networkservice.MonitorScopeSelector{})
+	if err != nil {
+		logger.Warnf("could not list connections of pod %v: %v", podName, err)
+		return
+	}
+	event, err := stream.Recv()
+	if err != nil {
+		logger.Warnf("could not read connection list for pod %v: %v", podName, err)
+		return
+	}
+
+	var closing sync.WaitGroup
+	for _, previous := range connectionsForPod(event.GetConnections(), podName) {
+		stale := previous.Clone()
+		stale.Id = stale.GetPath().GetPathSegments()[0].GetId()
+		stale.GetPath().Index = 0
+
+		closing.Add(1)
+		go func(stale *networkservice.Connection) {
+			defer closing.Done()
+			closeCtx, cancelClose := context.WithTimeout(ctx, staleCloseTimeout)
+			defer cancelClose()
+			if _, closeErr := nsmClient.Close(closeCtx, stale); closeErr != nil {
+				logger.Warnf("could not close connection %v of pod %v: %v", stale.Id, podName, closeErr)
+				return
+			}
+			logger.Infof("closed connection %v of pod %v", stale.Id, podName)
+		}(stale)
+	}
+	closing.Wait()
 }
 
 // connectionsForPod returns every connection nsmgr still holds for podName,
