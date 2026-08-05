@@ -477,7 +477,7 @@ func handlensmtask(parentCtx context.Context, clientConfig nscClient) error {
 		// a Close that hangs against an endpoint which is already gone must
 		// not hold the new connection back for the whole request timeout.
 		var closing sync.WaitGroup
-		for _, previous := range connectionsForPod(monitoredConnections, c.Name, u.Mechanism().Type) {
+		for _, previous := range connectionsForPod(monitoredConnections, c.Name) {
 			stale := previous.Clone()
 			stale.Id = stale.GetPath().GetPathSegments()[0].GetId()
 			stale.GetPath().Index = 0
@@ -527,21 +527,21 @@ func handlensmtask(parentCtx context.Context, clientConfig nscClient) error {
 	return nil
 }
 
-// connectionsForPod returns the connections nsmgr still holds for podName,
-// most recently refreshed first. They are all leftovers: a pod gets a fresh
-// connection id on every attempt, so none of them will ever be refreshed
-// again. Connection ids are built as
+// connectionsForPod returns every connection nsmgr still holds for podName,
+// most recently refreshed first, whatever mechanism they use. They are all
+// leftovers: a pod gets a fresh connection id on every attempt, so none of
+// them will ever be refreshed again. Pod names are stable for a StatefulSet,
+// so a pod that is deleted and recreated finds its own previous connections
+// here and must close all of them, not just the ones that happen to match
+// the mechanism it is asking for now. Connection ids are built as
 // "<podName>-<retry>-<index>-<suffix>", so the pod name prefix identifies
 // every incarnation of this pod's session, including ones this process did
 // not create (for example before a broker restart).
-func connectionsForPod(conns map[string]*networkservice.Connection, podName, mechType string) []*networkservice.Connection {
+func connectionsForPod(conns map[string]*networkservice.Connection, podName string) []*networkservice.Connection {
 	var out []*networkservice.Connection
 	for _, conn := range conns {
 		path := conn.GetPath()
 		if path == nil || len(path.GetPathSegments()) == 0 || path.GetIndex() != 1 {
-			continue
-		}
-		if conn.GetMechanism().GetType() != mechType {
 			continue
 		}
 		if !belongsToPod(conn, podName) {

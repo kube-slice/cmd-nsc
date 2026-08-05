@@ -54,23 +54,25 @@ func TestConnectionsForPod(t *testing.T) {
 		"live":    conn(pod+"-2-0-BBBBBBBB", 1, kernelmech.MECHANISM, now.Add(9*time.Minute)),
 		"other":   conn("srvd-dc-b-2-1-0-CCCCCCCC", 1, kernelmech.MECHANISM, now.Add(9*time.Minute)),
 		"ourside": conn(pod+"-3-0-DDDDDDDD", 0, kernelmech.MECHANISM, now.Add(9*time.Minute)),
-		"vfio":    conn(pod+"-4-0-EEEEEEEE", 1, "VFIO", now.Add(9*time.Minute)),
+		// A different mechanism is still this pod's connection and still has
+		// to go: the pod is attaching fresh and must not leave anything behind.
+		"vfio": conn(pod+"-4-0-EEEEEEEE", 1, "VFIO", now.Add(10*time.Minute)),
 	}
 
-	got := connectionsForPod(conns, pod, kernelmech.MECHANISM)
+	got := connectionsForPod(conns, pod)
 
-	if len(got) != 2 {
-		t.Fatalf("want the pod's 2 kernel connections at path index 1, got %d: %+v", len(got), got)
+	if len(got) != 3 {
+		t.Fatalf("want all 3 of the pod's connections at path index 1, got %d: %+v", len(got), got)
 	}
-	if got[0].GetId() != pod+"-2-0-BBBBBBBB" || got[1].GetId() != pod+"-1-0-AAAAAAAA" {
-		t.Errorf("got %q then %q, want most recently refreshed first",
-			got[0].GetId(), got[1].GetId())
+	if got[0].GetId() != pod+"-4-0-EEEEEEEE" || got[2].GetId() != pod+"-1-0-AAAAAAAA" {
+		t.Errorf("got %q first and %q last, want most recently refreshed first",
+			got[0].GetId(), got[2].GetId())
 	}
 }
 
 // A pod attaching for the first time has nothing to adopt and nothing to close.
 func TestConnectionsForPod_NoneExisting(t *testing.T) {
-	got := connectionsForPod(map[string]*networkservice.Connection{}, "fresh-pod-0", kernelmech.MECHANISM)
+	got := connectionsForPod(map[string]*networkservice.Connection{}, "fresh-pod-0")
 	if len(got) != 0 {
 		t.Fatalf("got %+v, want none", got)
 	}
@@ -85,10 +87,10 @@ func TestConnectionsForPod_LabelResolvesAmbiguousID(t *testing.T) {
 		"a": conn("srvd-dc-b-2-1-0-AAAAAAAA", 1, kernelmech.MECHANISM, now.Add(time.Minute)),
 	}
 
-	if got := connectionsForPod(conns, "srvd-dc-b", kernelmech.MECHANISM); len(got) != 0 {
+	if got := connectionsForPod(conns, "srvd-dc-b"); len(got) != 0 {
 		t.Fatalf("got %+v, want none: srvd-dc-b must not claim srvd-dc-b-2's connection", got)
 	}
-	if got := connectionsForPod(conns, "srvd-dc-b-2", kernelmech.MECHANISM); len(got) != 1 {
+	if got := connectionsForPod(conns, "srvd-dc-b-2"); len(got) != 1 {
 		t.Fatalf("got %+v, want the connection to be found by its own pod", got)
 	}
 }
@@ -99,7 +101,7 @@ func TestConnectionsForPod_UnlabelledFallsBackToID(t *testing.T) {
 	unlabelled := withPodLabel("pg-dcdr-dc-b-1-2-0-BBBBBBBB", 1, kernelmech.MECHANISM, now.Add(time.Minute), "")
 	conns := map[string]*networkservice.Connection{"a": unlabelled}
 
-	if got := connectionsForPod(conns, "pg-dcdr-dc-b-1", kernelmech.MECHANISM); len(got) != 1 {
+	if got := connectionsForPod(conns, "pg-dcdr-dc-b-1"); len(got) != 1 {
 		t.Fatalf("got %+v, want the unlabelled connection matched by id", got)
 	}
 }
