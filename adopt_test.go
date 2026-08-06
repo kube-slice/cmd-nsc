@@ -291,3 +291,45 @@ func TestPreCloseKeepsTheConnectionBeingReused(t *testing.T) {
 		t.Errorf("closed %v, want only the earlier incarnation %q", closed, staleID)
 	}
 }
+
+// A connection that came up once and then stopped being refreshed used to leave
+// the session parked for ever: the retry client only counts initial Requests,
+// and refresh replays below it, so failing refreshes exhausted nothing. That is
+// how four pods sat without an interface for six hours, and how a replacement
+// slice gateway left its cluster on one cross-DC path instead of two.
+//
+// The verdict is read from the nsmgr's own record. A live connection is renewed
+// at roughly 0.4x its token lifetime, so an expiry well in the past means
+// renewal has stopped.
+func TestSessionHealthVerdictFromExpiry(t *testing.T) {
+	for name, tc := range map[string]struct {
+		expiry time.Time
+		dead   bool
+	}{
+		"freshly refreshed":              {time.Now().Add(10 * time.Minute), false},
+		"renewal due but not late":       {time.Now().Add(30 * time.Second), false},
+		"just past expiry, within grace": {time.Now().Add(-30 * time.Second), false},
+		"several renewals missed":        {time.Now().Add(-5 * time.Minute), true},
+	} {
+		conn := brokeredConnection("runfix-0", "runfix-0-0-uid", podNetNS, tc.expiry)
+		overdue := time.Since(latestExpiry(conn))
+		if got := overdue > connectionExpiryGrace; got != tc.dead {
+			t.Errorf("%s: declared dead=%v, want %v (overdue by %v, grace %v)",
+				name, got, tc.dead, overdue.Truncate(time.Second), connectionExpiryGrace)
+		}
+	}
+}
+
+// The grace has to cover more than one missed renewal, or a single slow refresh
+// would tear down a working connection.
+func TestSessionHealthGraceExceedsOneRenewalInterval(t *testing.T) {
+	// refresh renews at ~0.4x the token lifetime; tokens here are 10 minutes.
+	renewalInterval := 4 * time.Minute
+	if connectionExpiryGrace >= renewalInterval {
+		t.Errorf("grace %v is at least a full renewal interval %v; a connection would be killed before its next renewal is even due",
+			connectionExpiryGrace, renewalInterval)
+	}
+	if connectionHealthInterval > connectionExpiryGrace {
+		t.Errorf("polling every %v cannot notice a %v grace promptly", connectionHealthInterval, connectionExpiryGrace)
+	}
+}

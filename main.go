@@ -641,10 +641,109 @@ func handlensmtask(parentCtx context.Context, clientConfig nscClient) error {
 		logger.Infof("successfully connected to %v. Response: %v", u.NetworkService(), resp)
 	}
 
-	// Wait for cancel event to terminate
+	// Wait for cancel event to terminate, or for the connection to stop being
+	// refreshed underneath us.
+	watchConnectionHealth(signalCtx, cancelSignalCtx, monitorClient, c.Name, logger)
+
 	<-signalCtx.Done()
-	fmt.Println("signalctx cancelled")
+	logger.Infof("session for pod %v ended", c.Name)
 	return nil
+}
+
+const (
+	// connectionHealthInterval is how often a parked session re-reads the
+	// nsmgr's record of its own connection.
+	connectionHealthInterval = 60 * time.Second
+	// connectionExpiryGrace is how far past its expiry a connection is allowed
+	// to drift before the session gives up on it. refresh renews at roughly
+	// 0.4x the token lifetime, so this is several missed renewals, not one.
+	connectionExpiryGrace = 2 * time.Minute
+)
+
+// watchConnectionHealth ends the session when the pod's connection has stopped
+// being refreshed.
+//
+// A pod whose connection dies quietly was never rebuilt. The retry client does
+// give up on a failing *initial* Request -- it exhausts maxRetry, cancels the
+// session, and the sidecar re-attaches -- but refresh replays through begin's
+// event factory, which re-enters the chain below the retry client, so failing
+// refreshes decrement nothing. A connection that came up once and then stopped
+// being renewable therefore exhausted nothing at all: this handler stayed parked
+// on signalCtx and the pod stayed dead until a human noticed. Measured on a live
+// cluster as six hundred refresh failures in six minutes against a namespace
+// that no longer existed, with the session never ending; elsewhere as four pods
+// with no interface for six hours, and as a replacement slice gateway that left
+// its cluster on one cross-DC path instead of two.
+//
+// The signal is the nsmgr's own record rather than anything about the interface,
+// which this broker cannot inspect: it does not share the pod's namespace and
+// does not run with hostPID. A live connection is renewed long before its token
+// expires, so an expiry that has slipped well into the past means renewal has
+// stopped. That cannot be true of a healthy connection, and it says nothing
+// about one that is merely slow to set up -- the mistake the removed watchdog
+// made.
+func watchConnectionHealth(
+	ctx context.Context,
+	cancel context.CancelFunc,
+	monitorClient networkservice.MonitorConnectionClient,
+	podName string,
+	logger log.Logger,
+) {
+	go func() {
+		ticker := time.NewTicker(connectionHealthInterval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+
+			conns, err := liveConnectionsForPod(ctx, monitorClient, podName)
+			if err != nil {
+				// Could not ask. Says nothing about the connection, so leave it
+				// alone: ending a healthy session because the nsmgr was briefly
+				// unreachable would be its own outage.
+				continue
+			}
+			if len(conns) == 0 {
+				logger.Errorf("nsmgr no longer holds a connection for pod %v, ending session so it can attach again", podName)
+				cancel()
+				return
+			}
+
+			expiry := latestExpiry(conns[0])
+			if overdue := time.Since(expiry); overdue > connectionExpiryGrace {
+				logger.Errorf("connection %v of pod %v has not been refreshed for %v past its expiry, ending session so it can attach again",
+					conns[0].GetId(), podName, overdue.Truncate(time.Second))
+				cancel()
+				return
+			}
+		}
+	}()
+}
+
+// liveConnectionsForPod reads the nsmgr's current connections for podName,
+// newest first. Every caller that needs the control plane's view goes through
+// here: adoption, the stale sweep, and the session health watch.
+func liveConnectionsForPod(
+	ctx context.Context,
+	monitorClient networkservice.MonitorConnectionClient,
+	podName string,
+) ([]*networkservice.Connection, error) {
+	monitorCtx, cancelMonitor := context.WithTimeout(context.WithoutCancel(ctx), staleCloseTimeout)
+	defer cancelMonitor()
+
+	stream, err := monitorClient.MonitorConnections(monitorCtx, &networkservice.MonitorScopeSelector{})
+	if err != nil {
+		return nil, err
+	}
+	event, err := stream.Recv()
+	if err != nil {
+		return nil, err
+	}
+	return connectionsForPod(event.GetConnections(), podName), nil
 }
 
 // adoptConnectionForPod resumes the connection the nsmgr already holds for
@@ -678,22 +777,14 @@ func adoptConnectionForPod(
 	mech *networkservice.Mechanism,
 	logger log.Logger,
 ) *networkservice.Connection {
-	monitorCtx, cancelMonitor := context.WithTimeout(ctx, staleCloseTimeout)
-	defer cancelMonitor()
-
-	stream, err := monitorClient.MonitorConnections(monitorCtx, &networkservice.MonitorScopeSelector{})
+	candidates, err := liveConnectionsForPod(ctx, monitorClient, podName)
 	if err != nil {
 		logger.Warnf("could not list connections of pod %v to adopt: %v", podName, err)
 		return nil
 	}
-	event, err := stream.Recv()
-	if err != nil {
-		logger.Warnf("could not read connection list of pod %v to adopt: %v", podName, err)
-		return nil
-	}
 
 	// Newest first, so the most recently refreshed connection is preferred.
-	for _, candidate := range connectionsForPod(event.GetConnections(), podName) {
+	for _, candidate := range candidates {
 		if !sameNetNS(candidate.GetMechanism().GetParameters()[common.InodeURL], inodeURL) {
 			logger.Infof("not adopting connection %v of pod %v: it targets %v, this pod is %v",
 				candidate.GetId(), podName, candidate.GetMechanism().GetParameters()[common.InodeURL], inodeURL)
@@ -745,22 +836,14 @@ func closeConnectionsForPod(
 	// stale connections it exists to remove. Its own timeouts still bound it.
 	ctx = context.WithoutCancel(ctx)
 
-	monitorCtx, cancelMonitor := context.WithTimeout(ctx, staleCloseTimeout)
-	defer cancelMonitor()
-
-	stream, err := monitorClient.MonitorConnections(monitorCtx, &networkservice.MonitorScopeSelector{})
+	previousConns, err := liveConnectionsForPod(ctx, monitorClient, podName)
 	if err != nil {
 		logger.Warnf("could not list connections of pod %v: %v", podName, err)
 		return
 	}
-	event, err := stream.Recv()
-	if err != nil {
-		logger.Warnf("could not read connection list for pod %v: %v", podName, err)
-		return
-	}
 
 	var closing sync.WaitGroup
-	for _, previous := range connectionsForPod(event.GetConnections(), podName) {
+	for _, previous := range previousConns {
 		stale := previous.Clone()
 		stale.Id = stale.GetPath().GetPathSegments()[0].GetId()
 		stale.GetPath().Index = 0
