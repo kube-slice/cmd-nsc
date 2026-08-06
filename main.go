@@ -99,6 +99,24 @@ type server struct {
 type podSession struct {
 	cancel context.CancelFunc
 	done   chan struct{}
+	// superseded is set when a newer session for the same pod is taking over.
+	// The outgoing session then hands the connection across instead of closing
+	// it -- see supersededFromContext.
+	superseded *atomic.Bool
+}
+
+type supersededKey struct{}
+
+// supersededFromContext reports whether a newer session for this pod has taken
+// over, which means the connection must be left alone.
+//
+// A pod's connection id is stable, so the incoming session asks for the very id
+// this one holds: that request is a refresh and the interface never moves.
+// Closing on the way out would delete nsm0 and force the incoming session to
+// build it again -- a guaranteed outage on a path that should cost nothing.
+func supersededFromContext(ctx context.Context) bool {
+	flag, ok := ctx.Value(supersededKey{}).(*atomic.Bool)
+	return ok && flag.Load()
 }
 
 // closeAllSessions ends every live pod session and waits for each one to finish.
@@ -151,12 +169,17 @@ func (s *server) closeAllSessions(timeout time.Duration) (ended, live int) {
 // takeOver stops any session already running for key and waits for it to
 // finish, then registers this one. The returned release function unregisters
 // it and wakes anything waiting.
-func (s *server) takeOver(key string, cancel context.CancelFunc) func() {
+func (s *server) takeOver(key string, cancel context.CancelFunc, superseded *atomic.Bool) func() {
 	s.mu.Lock()
 	previous := s.sessions[key]
 	s.mu.Unlock()
 
 	if previous != nil {
+		// Tell it it is being replaced before cancelling, so its teardown hands
+		// the connection over rather than closing it.
+		if previous.superseded != nil {
+			previous.superseded.Store(true)
+		}
 		previous.cancel()
 		select {
 		case <-previous.done:
@@ -166,7 +189,7 @@ func (s *server) takeOver(key string, cancel context.CancelFunc) func() {
 		}
 	}
 
-	current := &podSession{cancel: cancel, done: make(chan struct{})}
+	current := &podSession{cancel: cancel, done: make(chan struct{}), superseded: superseded}
 	s.mu.Lock()
 	s.sessions[key] = current
 	s.mu.Unlock()
@@ -525,22 +548,19 @@ func handlensmtask(parentCtx context.Context, clientConfig nscClient) error {
 			},
 		}
 
-		// Close whatever the nsmgr still holds for this pod before asking for
-		// a new connection.
+		// Close whatever the nsmgr still holds for this pod from an *earlier
+		// incarnation* before asking for a connection -- but never the id we
+		// are about to reuse, which closeConnectionsForPod is told to keep.
 		//
-		// Every attempt gets a fresh id on purpose, so the connection the pod
-		// had a moment ago is never refreshed again by anyone. Left alone it
-		// stays registered until its token expires, and the teardown that
-		// follows removes nsm0 from the pod -- by then the interface belongs
-		// to the new connection. The pod's sidecar sees it vanish, asks for
-		// another connection, strands that one in turn, and the mesh
-		// reconnects itself once per token lifetime forever.
+		// A leftover is a connection nobody will refresh again. Left alone it
+		// stays registered until its token expires, and that teardown removes
+		// nsm0 from the pod -- by then the interface belongs to the live
+		// connection. The pod sees it vanish, asks again, strands another, and
+		// the mesh reconnects itself once per token lifetime forever.
 		//
-		// This has to happen before the Request below and not after: the new
-		// interface carries the same name in the same netns, so a Close that
-		// lands afterwards deletes the interface that was just created. The
-		// pod has no datapath at this point anyway, which is why its sidecar
-		// called us.
+		// It has to happen before the Request and not after: the interface
+		// carries the same name in the same netns, so a Close that lands
+		// afterwards deletes the one just created.
 		var resp *networkservice.Connection
 		adoptedExisting := false
 
@@ -557,7 +577,7 @@ func handlensmtask(parentCtx context.Context, clientConfig nscClient) error {
 		}
 
 		if !adoptedExisting {
-			closeConnectionsForPod(ctx, nsmClient, monitorClient, c.Name, logger)
+			closeConnectionsForPod(ctx, nsmClient, monitorClient, c.Name, id, logger)
 		}
 
 		// signalCtx, not ctx: this request must die with the pod that asked
@@ -601,6 +621,13 @@ func handlensmtask(parentCtx context.Context, clientConfig nscClient) error {
 				cancel()
 				return
 			}
+			if supersededFromContext(parentCtx) {
+				// A newer session for this pod is taking over and will ask for
+				// this same id. See supersededFromContext.
+				logger.Infof("handing connection to %v over to the newer session for this pod", u.NetworkService())
+				cancel()
+				return
+			}
 
 			teardownCtx := context.WithoutCancel(ctx)
 
@@ -612,7 +639,8 @@ func handlensmtask(parentCtx context.Context, clientConfig nscClient) error {
 			}
 			cancelClose()
 
-			closeConnectionsForPod(teardownCtx, nsmClient, monitorClient, c.Name, logger)
+			// The session is over, so nothing is being reused: close everything.
+			closeConnectionsForPod(teardownCtx, nsmClient, monitorClient, c.Name, "", logger)
 			cancel()
 		}()
 
@@ -713,7 +741,7 @@ func closeConnectionsForPod(
 	ctx context.Context,
 	nsmClient networkservice.NetworkServiceClient,
 	monitorClient networkservice.MonitorConnectionClient,
-	podName string,
+	podName, keepID string,
 	logger log.Logger,
 ) {
 	// Detached here too, so this works no matter what the caller hands in. It is
@@ -742,6 +770,17 @@ func closeConnectionsForPod(
 		stale := previous.Clone()
 		stale.Id = stale.GetPath().GetPathSegments()[0].GetId()
 		stale.GetPath().Index = 0
+
+		// Never close the id we are about to ask for. A pod's id is stable now,
+		// so the connection carrying it is this pod's live one: closing it
+		// removes nsm0 and the Request that follows has to build it again,
+		// which is the downtime this whole path exists to avoid. Re-requesting
+		// it instead is a refresh and leaves the interface alone. Leftovers
+		// from earlier incarnations carry a different UID, so they still close.
+		if keepID != "" && stale.GetId() == keepID {
+			logger.Infof("keeping connection %v of pod %v, it is the one being reused", stale.GetId(), podName)
+			continue
+		}
 
 		closing.Add(1)
 		go func(stale *networkservice.Connection) {
@@ -1006,9 +1045,10 @@ func (s *server) ProcessPod(ctx context.Context, req *nscpb.PodRequest) (*nscpb.
 	fmt.Println("NetworkService: ", clientSpec.networkService)
 	fmt.Println("InodeURL: ", clientSpec.inodeUrl)
 	// Call your NSM handling logic
-	sessionCtx, cancelSession := context.WithCancel(ctx)
+	superseded := &atomic.Bool{}
+	sessionCtx, cancelSession := context.WithCancel(context.WithValue(ctx, supersededKey{}, superseded))
 	defer cancelSession()
-	release := s.takeOver(clientSpec.namespace+"/"+clientSpec.podName, cancelSession)
+	release := s.takeOver(clientSpec.namespace+"/"+clientSpec.podName, cancelSession, superseded)
 	defer release()
 
 	if err := handlensmtask(sessionCtx, clientSpec); err != nil {

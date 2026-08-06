@@ -20,7 +20,7 @@ func TestTakeOverStopsPreviousSession(t *testing.T) {
 	const key = "demo/pg-dcdr-dc-b-1"
 
 	firstCtx, firstCancel := context.WithCancel(context.Background())
-	firstRelease := s.takeOver(key, firstCancel)
+	firstRelease := s.takeOver(key, firstCancel, &atomic.Bool{})
 
 	firstFinished := make(chan struct{})
 	go func() { // the first session, running until it is told to stop
@@ -32,7 +32,7 @@ func TestTakeOverStopsPreviousSession(t *testing.T) {
 	secondDone := make(chan struct{})
 	go func() {
 		_, secondCancel := context.WithCancel(context.Background())
-		defer s.takeOver(key, secondCancel)()
+		defer s.takeOver(key, secondCancel, &atomic.Bool{})()
 		close(secondDone)
 	}()
 
@@ -57,11 +57,11 @@ func TestTakeOverIsPerPod(t *testing.T) {
 	s := &server{sessions: make(map[string]*podSession)}
 
 	aCtx, aCancel := context.WithCancel(context.Background())
-	releaseA := s.takeOver("demo/pod-a", aCancel)
+	releaseA := s.takeOver("demo/pod-a", aCancel, &atomic.Bool{})
 	defer releaseA()
 
 	_, bCancel := context.WithCancel(context.Background())
-	releaseB := s.takeOver("demo/pod-b", bCancel)
+	releaseB := s.takeOver("demo/pod-b", bCancel, &atomic.Bool{})
 	defer releaseB()
 
 	if aCtx.Err() != nil {
@@ -81,7 +81,7 @@ func TestTakeOverReleasesMapEntry(t *testing.T) {
 			defer wg.Done()
 			_, cancel := context.WithCancel(context.Background())
 			defer cancel()
-			s.takeOver("demo/pod-"+string(rune('a'+i%26)), cancel)()
+			s.takeOver("demo/pod-"+string(rune('a'+i%26)), cancel, &atomic.Bool{})()
 		}(i)
 	}
 	wg.Wait()
@@ -103,7 +103,7 @@ func TestCloseAllSessionsClosesEveryLiveSession(t *testing.T) {
 
 	var cancelled int32
 	for _, pod := range []string{"pg-0", "pg-1", "pg-2"} {
-		release := s.takeOver(pod, func() { atomic.AddInt32(&cancelled, 1) })
+		release := s.takeOver(pod, func() { atomic.AddInt32(&cancelled, 1) }, &atomic.Bool{})
 		// A session ends by running its release, which is what closes done.
 		// Real sessions do that from handlensmtask's defer, after the Close.
 		go func(release func()) {
@@ -125,7 +125,7 @@ func TestCloseAllSessionsClosesEveryLiveSession(t *testing.T) {
 // grace period: being killed mid-shutdown is what leaves connections registered.
 func TestCloseAllSessionsGivesUpAtTheDeadline(t *testing.T) {
 	s := &server{sessions: make(map[string]*podSession)}
-	s.takeOver("wedged", func() {}) // never released
+	s.takeOver("wedged", func() {}, &atomic.Bool{}) // never released
 
 	start := time.Now()
 	closed, live := s.closeAllSessions(100 * time.Millisecond)
@@ -199,7 +199,7 @@ func TestCloseAllSessionsEndsSessionsWhileShuttingDown(t *testing.T) {
 
 	s := &server{sessions: make(map[string]*podSession)}
 	for _, pod := range []string{"pg-0", "pg-1"} {
-		release := s.takeOver(pod, func() {})
+		release := s.takeOver(pod, func() {}, &atomic.Bool{})
 		go func(release func()) {
 			time.Sleep(10 * time.Millisecond)
 			release()
@@ -209,5 +209,50 @@ func TestCloseAllSessionsEndsSessionsWhileShuttingDown(t *testing.T) {
 	ended, live := s.closeAllSessions(5 * time.Second)
 	if ended != 2 || live != 2 {
 		t.Errorf("ended %d of %d sessions, want 2 of 2", ended, live)
+	}
+}
+
+// When a pod's sidecar re-attaches while its previous session is still
+// running, takeOver cancels the old one. That cancellation must not close the
+// connection: the incoming session asks for the very same id -- ids are stable
+// per pod now -- so its request is a refresh and the interface never moves.
+// Closing on the way out deletes nsm0 and forces a rebuild, which is a
+// guaranteed outage on a path that should cost nothing.
+func TestSupersededSessionHandsTheConnectionOver(t *testing.T) {
+	s := &server{sessions: make(map[string]*podSession)}
+	const key = "demo/runfix-0"
+
+	outgoing := &atomic.Bool{}
+	releaseOld := s.takeOver(key, func() {}, outgoing)
+	go func() { time.Sleep(10 * time.Millisecond); releaseOld() }()
+
+	// The outgoing session's teardown reads the flag off its context.
+	outgoingCtx := context.WithValue(context.Background(), supersededKey{}, outgoing)
+	if supersededFromContext(outgoingCtx) {
+		t.Fatal("precondition: not superseded until a newer session arrives")
+	}
+
+	incoming := &atomic.Bool{}
+	release := s.takeOver(key, func() {}, incoming)
+	defer release()
+
+	if !supersededFromContext(outgoingCtx) {
+		t.Error("the outgoing session was not told it was superseded, so it will close the connection the new one reuses")
+	}
+	if supersededFromContext(context.WithValue(context.Background(), supersededKey{}, incoming)) {
+		t.Error("the incoming session must not consider itself superseded")
+	}
+}
+
+// A session that ends for any other reason -- pod gone, sidecar stopped --
+// still closes, or its connection is left registered to expire and take a
+// later incarnation's interface with it.
+func TestOrdinarySessionEndStillCloses(t *testing.T) {
+	if supersededFromContext(context.Background()) {
+		t.Error("a context with no flag must not read as superseded, or every session stops closing")
+	}
+	flag := &atomic.Bool{}
+	if supersededFromContext(context.WithValue(context.Background(), supersededKey{}, flag)) {
+		t.Error("an unset flag must not read as superseded")
 	}
 }

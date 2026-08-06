@@ -252,3 +252,42 @@ func TestAdoptionKeepsTheInterfaceName(t *testing.T) {
 		t.Errorf("preference targets %q, want the pod's namespace", got)
 	}
 }
+
+// A pod's id is stable now, so the connection carrying it is that pod's live
+// one. The sweep that runs before a Request must leave it alone: closing it
+// removes nsm0 and the Request then has to rebuild the interface, which is the
+// downtime the whole path exists to avoid. Leftovers from an earlier
+// incarnation carry a different UID, so they must still be closed.
+func TestPreCloseKeepsTheConnectionBeingReused(t *testing.T) {
+	const (
+		pod     = "runfix-0"
+		liveUID = "6f1a9c34-1b2e-4d55-9d8a-7c0e2f3b4a51"
+		deadUID = "0c7d5e21-9a3f-4e60-8b11-2d4f6a8c9e03"
+	)
+	keepID := connectionID(pod, liveUID, 0)
+	staleID := connectionID(pod, deadUID, 0)
+
+	now := time.Now().Add(9 * time.Minute)
+	conns := map[string]*networkservice.Connection{
+		"live":  brokeredConnection(pod, keepID, podNetNS, now),
+		"stale": brokeredConnection(pod, staleID, otherNetNS, now),
+	}
+
+	var closed []string
+	for _, previous := range connectionsForPod(conns, pod) {
+		id := previous.GetPath().GetPathSegments()[0].GetId()
+		if keepID != "" && id == keepID {
+			continue // what closeConnectionsForPod now does
+		}
+		closed = append(closed, id)
+	}
+
+	for _, id := range closed {
+		if id == keepID {
+			t.Fatal("the sweep closed the connection about to be reused; the pod loses nsm0 and must rebuild it")
+		}
+	}
+	if len(closed) != 1 || closed[0] != staleID {
+		t.Errorf("closed %v, want only the earlier incarnation %q", closed, staleID)
+	}
+}
