@@ -551,7 +551,7 @@ func handlensmtask(parentCtx context.Context, clientConfig nscClient) error {
 		// signalCtx for the same reason the Request below uses it: the adopted
 		// connection must be refreshed for exactly as long as this pod's
 		// session lives, and no longer.
-		if adopted := adoptConnectionForPod(signalCtx, nsmClient, monitorClient, c.Name, clientConfig.inodeUrl, logger); adopted != nil {
+		if adopted := adoptConnectionForPod(signalCtx, nsmClient, monitorClient, c.Name, clientConfig.inodeUrl, mech, logger); adopted != nil {
 			resp = adopted
 			adoptedExisting = true
 		}
@@ -653,6 +653,7 @@ func adoptConnectionForPod(
 	nsmClient networkservice.NetworkServiceClient,
 	monitorClient networkservice.MonitorConnectionClient,
 	podName, inodeURL string,
+	mech *networkservice.Mechanism,
 	logger log.Logger,
 ) *networkservice.Connection {
 	monitorCtx, cancelMonitor := context.WithTimeout(ctx, staleCloseTimeout)
@@ -681,7 +682,17 @@ func adoptConnectionForPod(
 		adopted.Id = adopted.GetPath().GetPathSegments()[0].GetId()
 		adopted.GetPath().Index = 0
 
-		resp, err := nsmClient.Request(ctx, &networkservice.NetworkServiceRequest{Connection: adopted})
+		// Carry the same mechanism the create path asks for, as both the
+		// connection's mechanism and the preference. It names the interface.
+		// Re-issuing without it let the kernel client fall back to a name
+		// generated from the network service -- "vl3-servic-<hash>" instead of
+		// nsm0 -- so the pod came back with an interface its application does
+		// not know to look for, which is indistinguishable from having none.
+		adopted.Mechanism = mech.Clone()
+		resp, err := nsmClient.Request(ctx, &networkservice.NetworkServiceRequest{
+			Connection:           adopted,
+			MechanismPreferences: []*networkservice.Mechanism{mech.Clone()},
+		})
 		if err != nil {
 			// The endpoint may have restarted under it, in which case there is
 			// nothing to resume. The caller closes and builds afresh.

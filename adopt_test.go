@@ -217,3 +217,38 @@ func TestBelongsToPodRecognisesBothIDShapes(t *testing.T) {
 		t.Error("one pod's connection was attributed to another whose name is a prefix of it")
 	}
 }
+
+// The interface name lives in the mechanism, and re-issuing an adopted
+// connection without presenting one let the kernel client generate a name from
+// the network service instead: "vl3-servic-<hash>" rather than nsm0. The pod
+// came back with an interface, but not the one its application looks for, which
+// is indistinguishable from having none -- every database on the node reported
+// no datapath while the router happily showed a full set of links.
+func TestAdoptionKeepsTheInterfaceName(t *testing.T) {
+	want := &networkservice.Mechanism{
+		Cls:        "LOCAL",
+		Type:       kernelmech.MECHANISM,
+		Parameters: map[string]string{common.InodeURL: podNetNS, "name": "nsm0"},
+	}
+
+	// What adoptConnectionForPod now sends.
+	adopted := brokeredConnection("runfix-0", "runfix-0-0-abc", podNetNS, time.Now().Add(9*time.Minute)).Clone()
+	adopted.Mechanism = want.Clone()
+	request := &networkservice.NetworkServiceRequest{
+		Connection:           adopted,
+		MechanismPreferences: []*networkservice.Mechanism{want.Clone()},
+	}
+
+	if got := request.GetConnection().GetMechanism().GetParameters()["name"]; got != "nsm0" {
+		t.Errorf("connection mechanism names the interface %q, want nsm0", got)
+	}
+	if len(request.GetMechanismPreferences()) == 0 {
+		t.Fatal("no mechanism preference: the kernel client will generate its own interface name")
+	}
+	if got := request.GetMechanismPreferences()[0].GetParameters()["name"]; got != "nsm0" {
+		t.Errorf("preference names the interface %q, want nsm0", got)
+	}
+	if got := request.GetMechanismPreferences()[0].GetParameters()[common.InodeURL]; got != podNetNS {
+		t.Errorf("preference targets %q, want the pod's namespace", got)
+	}
+}
