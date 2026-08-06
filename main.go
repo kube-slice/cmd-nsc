@@ -36,6 +36,7 @@ import (
 	"github.com/edwarnicke/grpcfd"
 	"github.com/kelseyhightower/envconfig"
 	"github.com/networkservicemesh/api/pkg/api/networkservice"
+	"github.com/networkservicemesh/api/pkg/api/networkservice/mechanisms/common"
 	kernelmech "github.com/networkservicemesh/api/pkg/api/networkservice/mechanisms/kernel"
 	vfiomech "github.com/networkservicemesh/api/pkg/api/networkservice/mechanisms/vfio"
 	"github.com/networkservicemesh/cmd-nsc/internal/config"
@@ -75,6 +76,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -99,8 +101,11 @@ type podSession struct {
 	done   chan struct{}
 }
 
-// closeAllSessions ends every live pod session and waits for each one to run
-// its close, so the process leaves nothing registered behind it.
+// closeAllSessions ends every live pod session and waits for each one to finish.
+//
+// It no longer closes their NSM connections: shuttingDown is set first, so each
+// session leaves its connection registered for the successor to adopt. What is
+// waited for here is the sessions unwinding, so the gRPC server can stop.
 //
 // Until now SIGTERM stopped the gRPC server and did nothing else. Every NSM
 // connection this broker held stayed registered, holding a token that nobody
@@ -119,7 +124,7 @@ type podSession struct {
 //
 // Sessions are cancelled first and waited for afterwards: their closes run
 // concurrently, and the process only has its termination grace period.
-func (s *server) closeAllSessions(timeout time.Duration) (closed, live int) {
+func (s *server) closeAllSessions(timeout time.Duration) (ended, live int) {
 	s.mu.Lock()
 	sessions := make([]*podSession, 0, len(s.sessions))
 	for _, session := range s.sessions {
@@ -135,12 +140,12 @@ func (s *server) closeAllSessions(timeout time.Duration) (closed, live int) {
 	for _, session := range sessions {
 		select {
 		case <-session.done:
-			closed++
+			ended++
 		case <-deadline:
-			return closed, len(sessions)
+			return ended, len(sessions)
 		}
 	}
-	return closed, len(sessions)
+	return ended, len(sessions)
 }
 
 // takeOver stops any session already running for key and waits for it to
@@ -182,11 +187,20 @@ const (
 	// uses. The peer may be gone, in which case the Close never completes.
 	staleCloseTimeout = 10 * time.Second
 	// shutdownCloseTimeout bounds how long shutdown waits for live sessions to
-	// close their connections. It has to fit inside the pod's termination grace
-	// period, or the kernel kills the process mid-close and leaves behind
-	// exactly what closing was meant to prevent.
+	// end. It has to fit inside the pod's termination grace period.
 	shutdownCloseTimeout = 20 * time.Second
 )
+
+// shuttingDown reports whether this process is on its way out, which changes
+// what the end of a session means.
+//
+// Ending a session normally -- the pod is gone, or its sidecar is re-attaching
+// -- means the connection is finished with and must be closed. Ending one
+// because the *broker* is stopping means the opposite: the pod is still there
+// and still using its interface, and the successor will adopt the connection
+// within seconds. Closing on the way out is what made a broker restart cost
+// every pod on the node its data plane.
+var shuttingDown atomic.Bool
 
 type nscClient struct {
 	podName        string
@@ -524,7 +538,21 @@ func handlensmtask(parentCtx context.Context, clientConfig nscClient) error {
 		// lands afterwards deletes the interface that was just created. The
 		// pod has no datapath at this point anyway, which is why its sidecar
 		// called us.
-		closeConnectionsForPod(ctx, nsmClient, monitorClient, c.Name, logger)
+		var resp *networkservice.Connection
+		adoptedExisting := false
+
+		// Resuming what is already there beats rebuilding it: the interface,
+		// its address and its routes survive untouched, and the slice router
+		// never has to be told anything. Only when there is nothing safe to
+		// resume do we fall through to the teardown below.
+		if adopted := adoptConnectionForPod(ctx, nsmClient, monitorClient, c.Name, clientConfig.inodeUrl, logger); adopted != nil {
+			resp = adopted
+			adoptedExisting = true
+		}
+
+		if !adoptedExisting {
+			closeConnectionsForPod(ctx, nsmClient, monitorClient, c.Name, logger)
+		}
 
 		// signalCtx, not ctx: this request must die with the pod that asked
 		// for it. ctx is rooted at context.Background(), so when the pod is
@@ -532,12 +560,15 @@ func handlensmtask(parentCtx context.Context, clientConfig nscClient) error {
 		// being retried -- up to maxRetry times the request timeout -- for a
 		// pod that no longer exists, against an endpoint that keeps
 		// cancelling it.
-		resp, err := nsmClient.Request(signalCtx, request)
-		if err != nil {
-			// Returning lets the pod's sidecar ask again straight away
-			// instead of waiting for its 10s interface watchdog, and stops
-			// this handler parking on a session that has no datapath.
-			return fmt.Errorf("requesting connection for pod %v: %w", c.Name, err)
+		if !adoptedExisting {
+			var err error
+			resp, err = nsmClient.Request(signalCtx, request)
+			if err != nil {
+				// Returning lets the pod's sidecar ask again straight away
+				// instead of waiting for its 10s interface watchdog, and stops
+				// this handler parking on a session that has no datapath.
+				return fmt.Errorf("requesting connection for pod %v: %w", c.Name, err)
+			}
 		}
 
 		defer func() {
@@ -557,6 +588,14 @@ func handlensmtask(parentCtx context.Context, clientConfig nscClient) error {
 			// orphan this whole path exists to prevent. Values are kept so the
 			// logger and any auth data survive; only the cancellation is
 			// dropped.
+			if shuttingDown.Load() {
+				// Left deliberately registered: the pod still needs it and the
+				// next broker adopts it. See shuttingDown.
+				logger.Infof("shutting down, leaving connection to %v in place for the next broker", u.NetworkService())
+				cancel()
+				return
+			}
+
 			teardownCtx := context.WithoutCancel(ctx)
 
 			closeCtx, cancelClose := context.WithTimeout(teardownCtx, staleCloseTimeout)
@@ -577,6 +616,75 @@ func handlensmtask(parentCtx context.Context, clientConfig nscClient) error {
 	// Wait for cancel event to terminate
 	<-signalCtx.Done()
 	fmt.Println("signalctx cancelled")
+	return nil
+}
+
+// adoptConnectionForPod resumes the connection the nsmgr already holds for
+// podName rather than tearing it down and building a new one, and returns nil
+// when there is nothing safe to resume.
+//
+// This is what makes a broker restart stop being an outage. The interface, its
+// address and its routes all belong to the connection, not to this process, so
+// leaving the connection alone leaves the pod's data plane untouched. Rebuilding
+// instead cost every pod on the node its nsm0 and drew a fresh address, which is
+// what left the slice router forwarding to nexthops that no longer existed.
+//
+// It works because the client path segment is named after the *pod*
+// (client.WithName below), and that name outlives this process. updatepath sees
+// a request whose current segment name already matches, reuses the existing
+// connection id and adds no segment, so the request travels the chain as a
+// refresh: nothing downstream rebuilds anything.
+//
+// The netns guard is not optional. A connection belonging to an earlier
+// incarnation of the pod names a network namespace whose process is gone.
+// Adopting one asks the forwarder to enter /proc/<pid>/ns/net for a dead pid,
+// which it answers with "no such file or directory: all forwarders have failed"
+// for every attach on the node -- measured at four thousand in three minutes,
+// with the slice router holding zero client interfaces. A candidate whose
+// namespace is not this pod's is left for the caller to close.
+func adoptConnectionForPod(
+	ctx context.Context,
+	nsmClient networkservice.NetworkServiceClient,
+	monitorClient networkservice.MonitorConnectionClient,
+	podName, inodeURL string,
+	logger log.Logger,
+) *networkservice.Connection {
+	monitorCtx, cancelMonitor := context.WithTimeout(ctx, staleCloseTimeout)
+	defer cancelMonitor()
+
+	stream, err := monitorClient.MonitorConnections(monitorCtx, &networkservice.MonitorScopeSelector{})
+	if err != nil {
+		logger.Warnf("could not list connections of pod %v to adopt: %v", podName, err)
+		return nil
+	}
+	event, err := stream.Recv()
+	if err != nil {
+		logger.Warnf("could not read connection list of pod %v to adopt: %v", podName, err)
+		return nil
+	}
+
+	// Newest first, so the most recently refreshed connection is preferred.
+	for _, candidate := range connectionsForPod(event.GetConnections(), podName) {
+		if !sameNetNS(candidate.GetMechanism().GetParameters()[common.InodeURL], inodeURL) {
+			logger.Infof("not adopting connection %v of pod %v: it targets %v, this pod is %v",
+				candidate.GetId(), podName, candidate.GetMechanism().GetParameters()[common.InodeURL], inodeURL)
+			continue
+		}
+
+		adopted := candidate.Clone()
+		adopted.Id = adopted.GetPath().GetPathSegments()[0].GetId()
+		adopted.GetPath().Index = 0
+
+		resp, err := nsmClient.Request(ctx, &networkservice.NetworkServiceRequest{Connection: adopted})
+		if err != nil {
+			// The endpoint may have restarted under it, in which case there is
+			// nothing to resume. The caller closes and builds afresh.
+			logger.Warnf("could not adopt connection %v of pod %v, rebuilding instead: %v", adopted.GetId(), podName, err)
+			return nil
+		}
+		logger.Infof("adopted connection %v of pod %v, its interface was left in place", adopted.GetId(), podName)
+		return resp
+	}
 	return nil
 }
 
@@ -764,12 +872,13 @@ func main() {
 	defer stopSignals()
 	go func() {
 		<-signalCtx.Done()
-		Logger.Infof("shutting down, closing live pod sessions")
-		closed, live := nscServer.closeAllSessions(shutdownCloseTimeout)
-		if closed < live {
-			Logger.Errorf("closed %v of %v pod sessions before the shutdown deadline; the rest stay registered until they expire", closed, live)
+		Logger.Infof("shutting down, ending pod sessions and leaving their connections for the next broker")
+		shuttingDown.Store(true)
+		ended, live := nscServer.closeAllSessions(shutdownCloseTimeout)
+		if ended < live {
+			Logger.Errorf("ended %v of %v pod sessions before the shutdown deadline", ended, live)
 		} else {
-			Logger.Infof("closed %v pod sessions", closed)
+			Logger.Infof("ended %v pod sessions", ended)
 		}
 		// Stop rather than GracefulStop: ProcessPod does not return until its
 		// pod is gone, so waiting for in-flight RPCs waits for ever and the

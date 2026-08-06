@@ -170,3 +170,44 @@ func TestTeardownContextSurvivesSessionCancellation(t *testing.T) {
 		t.Error("expected a context derived from the cancelled session to be dead; the regression guard is not testing anything")
 	}
 }
+
+// Ending a session normally means the connection is finished with and must be
+// closed. Ending one because the broker is stopping means the opposite: the pod
+// is still there, still using its interface, and the successor adopts it within
+// seconds. Closing on the way out is what made a broker restart cost every pod
+// on the node its data plane -- dc-c went from seventeen client interfaces to
+// none, with no pod having restarted.
+func TestShutdownFlagDecidesWhetherASessionCloses(t *testing.T) {
+	t.Cleanup(func() { shuttingDown.Store(false) })
+
+	shuttingDown.Store(false)
+	if shuttingDown.Load() {
+		t.Fatal("precondition: not shutting down")
+	}
+
+	shuttingDown.Store(true)
+	if !shuttingDown.Load() {
+		t.Error("shutdown must be observable from the session teardown, or it still closes")
+	}
+}
+
+// Shutdown still has to end every session so the process can stop; only the
+// close is skipped.
+func TestCloseAllSessionsEndsSessionsWhileShuttingDown(t *testing.T) {
+	t.Cleanup(func() { shuttingDown.Store(false) })
+	shuttingDown.Store(true)
+
+	s := &server{sessions: make(map[string]*podSession)}
+	for _, pod := range []string{"pg-0", "pg-1"} {
+		release := s.takeOver(pod, func() {})
+		go func(release func()) {
+			time.Sleep(10 * time.Millisecond)
+			release()
+		}(release)
+	}
+
+	ended, live := s.closeAllSessions(5 * time.Second)
+	if ended != 2 || live != 2 {
+		t.Errorf("ended %d of %d sessions, want 2 of 2", ended, live)
+	}
+}
