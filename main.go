@@ -231,7 +231,6 @@ type nscClient struct {
 	namespace      string
 	networkService string
 	inodeUrl       string
-	count          int32
 	// uid is the pod's Kubernetes UID. It is what makes a connection id stable
 	// across retries and unique across clusters -- see connectionID.
 	uid string
@@ -461,7 +460,7 @@ func handlensmtask(parentCtx context.Context, clientConfig nscClient) error {
 		client.WithClientURL(&c.ConnectTo),
 		client.WithName(c.Name),
 		//client.WithAuthorizeClient(authorize.NewClient(authorize.Any())),
-		client.WithHealClient(heal.NewClient(ctx)),
+		client.WithHealClient(heal.NewClient(ctx, healOptions(c, clientConfig.inodeUrl, ownNetNS)...)),
 		client.WithAdditionalFunctionality(
 			//ensureexpires.NewClient(3*time.Minute),
 			clientinfo.NewClient(),
@@ -524,14 +523,9 @@ func handlensmtask(parentCtx context.Context, clientConfig nscClient) error {
 	for i := 0; i < len(c.NetworkServices); i++ {
 		// Update network services configs
 		u := (*nsurl.NSURL)(&c.NetworkServices[i])
-		fmt.Println("****************************************")
-		fmt.Println(strings.ToUpper(u.Scheme))
-		fmt.Println("****************************************")
 		id := connectionID(c.Name, clientConfig.uid, i)
 		mech := u.Mechanism()
 		mech.Parameters["inodeURL"] = clientConfig.inodeUrl
-		fmt.Println("####################################")
-		fmt.Println("machnism: ", mech)
 		// Construct a request
 		label := u.Labels()
 		label["podName"] = clientConfig.podName
@@ -857,6 +851,24 @@ func latestExpiry(conn *networkservice.Connection) time.Time {
 	return newest
 }
 
+// healOptions assembles heal's configuration from the process config.
+//
+// The three LivenessCheck settings have existed in the config all along and
+// nothing read them, so a deployment setting LIVENESS_CHECK_ENABLED changed
+// nothing while the default advertised that the check was on. They are wired
+// now, with the namespace-correct check rather than the upstream one -- see
+// podLivenessCheck for why the upstream one cannot be used from a broker.
+func healOptions(c *config.Config, podInodeURL, ownInodeURL string) []heal.Option {
+	options := []heal.Option{
+		heal.WithLivenessCheckInterval(c.LivenessCheckInterval),
+		heal.WithLivenessCheckTimeout(c.LivenessCheckTimeout),
+	}
+	if c.LivenessCheckEnabled {
+		options = append(options, heal.WithLivenessCheck(podLivenessCheck(podInodeURL, ownInodeURL)))
+	}
+	return options
+}
+
 // connectionID is the id a pod's connection carries, for every attempt, for as
 // long as that pod exists.
 //
@@ -1023,7 +1035,6 @@ func (s *server) ProcessPod(ctx context.Context, req *nscpb.PodRequest) (*nscpb.
 		nodeName:       req.NodeName,
 		networkService: req.NetworkService,
 		inodeUrl:       req.InodeURL,
-		count:          req.RetryCount,
 	}
 	// This broker owns one node. Serving a pod from another node would create
 	// its interface against the wrong nsmgr, using a netns inode that means

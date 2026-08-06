@@ -46,8 +46,18 @@ type Config struct {
 	LocalDNSServerEnabled bool   `default:"true" desc:"Local DNS Server enabled/disabled"`
 	LocalDNSServerAddress string `default:"127.0.0.1:53" desc:"Default address for local DNS server"`
 
-	LivenessCheckEnabled  bool          `default:"true" desc:"Dataplane liveness check enabled/disabled"`
-	LivenessCheckInterval time.Duration `default:"200ms" desc:"Dataplane liveness check interval"`
+	LivenessCheckEnabled bool `default:"true" desc:"Dataplane liveness check enabled/disabled"`
+	// 5s, not the 200ms this setting carried while nothing read it.
+	//
+	// heal runs one ticker per connection, and upstream runs one nsc per
+	// application pod, so there it is one check every 200ms in a process that
+	// holds a single connection. This broker holds every connection on its
+	// node, and each check locks an OS thread and enters that pod's network
+	// namespace, so the same interval would mean hundreds of namespace switches
+	// a second in one process. Five seconds still finds a dead data path in
+	// seconds rather than at the ten minute token expiry, which is the only
+	// thing that noticed before.
+	LivenessCheckInterval time.Duration `default:"5s" desc:"Dataplane liveness check interval"`
 	LivenessCheckTimeout  time.Duration `default:"1s" desc:"Dataplane liveness check timeout"`
 }
 
