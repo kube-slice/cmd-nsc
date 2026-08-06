@@ -99,6 +99,50 @@ type podSession struct {
 	done   chan struct{}
 }
 
+// closeAllSessions ends every live pod session and waits for each one to run
+// its close, so the process leaves nothing registered behind it.
+//
+// Until now SIGTERM stopped the gRPC server and did nothing else. Every NSM
+// connection this broker held stayed registered, holding a token that nobody
+// was left to refresh, and NSM closed each one when it expired -- roughly ten
+// minutes later, long after a replacement broker had rebuilt every pod on the
+// node. That close removes the interface by name in the pod's namespace, so it
+// took out the *live* interface belonging to the replacement's connection. The
+// result was a node-wide loss of the data plane on a timer, once per restart,
+// with nothing restarting to explain it. Measured on a three cluster loop: the
+// slice router went from seventeen client interfaces to none, ten minutes after
+// a broker restart, with no pod having restarted in between.
+//
+// Closing here also hands each address back to the vl3 IPAM straight away, so
+// the replacement can be given the same ones instead of allocating fresh
+// addresses and changing every nexthop the slice router has been told about.
+//
+// Sessions are cancelled first and waited for afterwards: their closes run
+// concurrently, and the process only has its termination grace period.
+func (s *server) closeAllSessions(timeout time.Duration) (closed, live int) {
+	s.mu.Lock()
+	sessions := make([]*podSession, 0, len(s.sessions))
+	for _, session := range s.sessions {
+		sessions = append(sessions, session)
+	}
+	s.mu.Unlock()
+
+	for _, session := range sessions {
+		session.cancel()
+	}
+
+	deadline := time.After(timeout)
+	for _, session := range sessions {
+		select {
+		case <-session.done:
+			closed++
+		case <-deadline:
+			return closed, len(sessions)
+		}
+	}
+	return closed, len(sessions)
+}
+
 // takeOver stops any session already running for key and waits for it to
 // finish, then registers this one. The returned release function unregisters
 // it and wakes anything waiting.
@@ -137,6 +181,11 @@ const (
 	// staleCloseTimeout bounds a Close of a connection this pod no longer
 	// uses. The peer may be gone, in which case the Close never completes.
 	staleCloseTimeout = 10 * time.Second
+	// shutdownCloseTimeout bounds how long shutdown waits for live sessions to
+	// close their connections. It has to fit inside the pod's termination grace
+	// period, or the kernel kills the process mid-close and leaves behind
+	// exactly what closing was meant to prevent.
+	shutdownCloseTimeout = 20 * time.Second
 )
 
 type nscClient struct {
@@ -683,17 +732,28 @@ func main() {
 		}),
 		grpc.UnaryInterceptor(recoverPanics),
 	)
-	nscpb.RegisterNSCServiceServer(grpcServer, &server{
+	nscServer := &server{
 		clientset: clientset,
 		sessions:  make(map[string]*podSession),
-	})
+	}
+	nscpb.RegisterNSCServiceServer(grpcServer, nscServer)
 	signalCtx, stopSignals := signal.NotifyContext(context.Background(),
 		os.Interrupt, syscall.SIGHUP, syscall.SIGTERM, syscall.SIGQUIT)
 	defer stopSignals()
 	go func() {
 		<-signalCtx.Done()
-		Logger.Infof("shutting down")
-		grpcServer.GracefulStop()
+		Logger.Infof("shutting down, closing live pod sessions")
+		closed, live := nscServer.closeAllSessions(shutdownCloseTimeout)
+		if closed < live {
+			Logger.Errorf("closed %v of %v pod sessions before the shutdown deadline; the rest stay registered until they expire", closed, live)
+		} else {
+			Logger.Infof("closed %v pod sessions", closed)
+		}
+		// Stop rather than GracefulStop: ProcessPod does not return until its
+		// pod is gone, so waiting for in-flight RPCs waits for ever and the
+		// process is killed with its connections still registered -- the thing
+		// this shutdown exists to prevent.
+		grpcServer.Stop()
 	}()
 
 	fmt.Println("starting server at 50052")

@@ -5,6 +5,7 @@ package main
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -89,5 +90,49 @@ func TestTakeOverReleasesMapEntry(t *testing.T) {
 	defer s.mu.Unlock()
 	if len(s.sessions) != 0 {
 		t.Fatalf("sessions map still holds %d entries, want 0", len(s.sessions))
+	}
+}
+
+// A broker that exits without closing its connections leaves them registered
+// with a token nobody refreshes. NSM closes them when they expire, ten minutes
+// later, and that close removes the interface by name in the pod's namespace --
+// by then the live interface of whatever rebuilt the pod. Shutdown has to end
+// the sessions itself.
+func TestCloseAllSessionsClosesEveryLiveSession(t *testing.T) {
+	s := &server{sessions: make(map[string]*podSession)}
+
+	var cancelled int32
+	for _, pod := range []string{"pg-0", "pg-1", "pg-2"} {
+		release := s.takeOver(pod, func() { atomic.AddInt32(&cancelled, 1) })
+		// A session ends by running its release, which is what closes done.
+		// Real sessions do that from handlensmtask's defer, after the Close.
+		go func(release func()) {
+			time.Sleep(10 * time.Millisecond)
+			release()
+		}(release)
+	}
+
+	closed, live := s.closeAllSessions(5 * time.Second)
+	if live != 3 || closed != 3 {
+		t.Errorf("closed %d of %d sessions, want 3 of 3", closed, live)
+	}
+	if got := atomic.LoadInt32(&cancelled); got != 3 {
+		t.Errorf("cancelled %d sessions, want 3", got)
+	}
+}
+
+// A session that will not finish must not hold the process past its termination
+// grace period: being killed mid-shutdown is what leaves connections registered.
+func TestCloseAllSessionsGivesUpAtTheDeadline(t *testing.T) {
+	s := &server{sessions: make(map[string]*podSession)}
+	s.takeOver("wedged", func() {}) // never released
+
+	start := time.Now()
+	closed, live := s.closeAllSessions(100 * time.Millisecond)
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Errorf("waited %v for a wedged session, want to give up at the deadline", elapsed)
+	}
+	if closed != 0 || live != 1 {
+		t.Errorf("closed %d of %d, want 0 of 1", closed, live)
 	}
 }
