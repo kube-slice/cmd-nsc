@@ -46,19 +46,28 @@ type Config struct {
 	LocalDNSServerEnabled bool   `default:"true" desc:"Local DNS Server enabled/disabled"`
 	LocalDNSServerAddress string `default:"127.0.0.1:53" desc:"Default address for local DNS server"`
 
-	LivenessCheckEnabled bool `default:"true" desc:"Dataplane liveness check enabled/disabled"`
-	// 5s, not the 200ms this setting carried while nothing read it.
+	// The three liveness settings below are inherited from upstream and are NOT
+	// wired here. Upstream runs one nsc inside each application pod, so its data
+	// plane check pings from the pod's own network namespace and measures the
+	// real path. This broker serves every pod on its node from its own namespace
+	// and is not an application pod: it has no nsm0, and the addresses the check
+	// targets are unreachable from where it runs.
 	//
-	// heal runs one ticker per connection, and upstream runs one nsc per
-	// application pod, so there it is one check every 200ms in a process that
-	// holds a single connection. This broker holds every connection on its
-	// node, and each check locks an OS thread and enters that pod's network
-	// namespace, so the same interval would mean hundreds of namespace switches
-	// a second in one process. Five seconds still finds a dead data path in
-	// seconds rather than at the ten minute token expiry, which is the only
-	// thing that noticed before.
-	LivenessCheckInterval time.Duration `default:"5s" desc:"Dataplane liveness check interval"`
-	LivenessCheckTimeout  time.Duration `default:"1s" desc:"Dataplane liveness check timeout"`
+	// Running the check in each pod's namespace instead was implemented and
+	// discarded, because it cannot work in this deployment: resolving a pod's
+	// namespace inode to a /proc/<pid>/ns/net path requires seeing that pod's
+	// processes, and this broker does not run with hostPID. Measured on a live
+	// cluster it saw 4 processes, all its own, and every check failed to locate
+	// the namespace and fell back to reporting the connection live -- a full
+	// /proc scan per connection every interval, for no signal at all. The
+	// forwarder can do this only because it runs with hostPID: true.
+	//
+	// Giving the broker hostPID would make it workable, at the cost of letting a
+	// pod-serving component see every process on the node. Left unwired until
+	// someone decides that trade is worth making.
+	LivenessCheckEnabled  bool          `default:"false" desc:"Dataplane liveness check (unused: see comment)"`
+	LivenessCheckInterval time.Duration `default:"5s" desc:"Dataplane liveness check interval (unused)"`
+	LivenessCheckTimeout  time.Duration `default:"1s" desc:"Dataplane liveness check timeout (unused)"`
 }
 
 // IsValid - check if configuration is valid

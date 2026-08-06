@@ -460,7 +460,7 @@ func handlensmtask(parentCtx context.Context, clientConfig nscClient) error {
 		client.WithClientURL(&c.ConnectTo),
 		client.WithName(c.Name),
 		//client.WithAuthorizeClient(authorize.NewClient(authorize.Any())),
-		client.WithHealClient(heal.NewClient(ctx, healOptions(c, clientConfig.inodeUrl, ownNetNS)...)),
+		client.WithHealClient(heal.NewClient(ctx)),
 		client.WithAdditionalFunctionality(
 			//ensureexpires.NewClient(3*time.Minute),
 			clientinfo.NewClient(),
@@ -849,24 +849,6 @@ func latestExpiry(conn *networkservice.Connection) time.Time {
 		}
 	}
 	return newest
-}
-
-// healOptions assembles heal's configuration from the process config.
-//
-// The three LivenessCheck settings have existed in the config all along and
-// nothing read them, so a deployment setting LIVENESS_CHECK_ENABLED changed
-// nothing while the default advertised that the check was on. They are wired
-// now, with the namespace-correct check rather than the upstream one -- see
-// podLivenessCheck for why the upstream one cannot be used from a broker.
-func healOptions(c *config.Config, podInodeURL, ownInodeURL string) []heal.Option {
-	options := []heal.Option{
-		heal.WithLivenessCheckInterval(c.LivenessCheckInterval),
-		heal.WithLivenessCheckTimeout(c.LivenessCheckTimeout),
-	}
-	if c.LivenessCheckEnabled {
-		options = append(options, heal.WithLivenessCheck(podLivenessCheck(podInodeURL, ownInodeURL)))
-	}
-	return options
 }
 
 // connectionID is the id a pod's connection carries, for every attempt, for as
