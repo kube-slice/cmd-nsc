@@ -547,12 +547,27 @@ func handlensmtask(parentCtx context.Context, clientConfig nscClient) error {
 			// anything a failed Close left over earlier, and that leftover
 			// expires later and takes the next incarnation's interface with
 			// it.
-			closeCtx, cancelClose := context.WithTimeout(ctx, staleCloseTimeout)
-			_, _ = nsmClient.Close(closeCtx, resp)
-			cancelClose()
-			logger.Infof("closed connection to %v", u.NetworkService())
+			//
+			// The close runs on a context detached from this session's. A
+			// session ends by being cancelled -- that is how shutdown and pod
+			// handover both end one -- so deriving the close deadline from ctx
+			// produced a context that was already expired before Close was
+			// called. Every Close then failed instantly with DeadlineExceeded
+			// while the shutdown counted the session as closed, which is the
+			// orphan this whole path exists to prevent. Values are kept so the
+			// logger and any auth data survive; only the cancellation is
+			// dropped.
+			teardownCtx := context.WithoutCancel(ctx)
 
-			closeConnectionsForPod(ctx, nsmClient, monitorClient, c.Name, logger)
+			closeCtx, cancelClose := context.WithTimeout(teardownCtx, staleCloseTimeout)
+			if _, closeErr := nsmClient.Close(closeCtx, resp); closeErr != nil {
+				logger.Errorf("closing connection to %v: %v", u.NetworkService(), closeErr)
+			} else {
+				logger.Infof("closed connection to %v", u.NetworkService())
+			}
+			cancelClose()
+
+			closeConnectionsForPod(teardownCtx, nsmClient, monitorClient, c.Name, logger)
 			cancel()
 		}()
 
@@ -576,6 +591,13 @@ func closeConnectionsForPod(
 	podName string,
 	logger log.Logger,
 ) {
+	// Detached here too, so this works no matter what the caller hands in. It is
+	// called on paths where the session context has already been cancelled, and
+	// a cancelled parent turns every deadline below into an already-expired one:
+	// the sweep then reports failure without having closed anything, leaving the
+	// stale connections it exists to remove. Its own timeouts still bound it.
+	ctx = context.WithoutCancel(ctx)
+
 	monitorCtx, cancelMonitor := context.WithTimeout(ctx, staleCloseTimeout)
 	defer cancelMonitor()
 

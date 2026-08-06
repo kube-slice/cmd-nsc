@@ -136,3 +136,37 @@ func TestCloseAllSessionsGivesUpAtTheDeadline(t *testing.T) {
 		t.Errorf("closed %d of %d, want 0 of 1", closed, live)
 	}
 }
+
+// A session ends by being cancelled -- that is how both shutdown and pod
+// handover end one -- and the teardown that follows must still be able to talk
+// to the nsmgr. Deriving the close deadline from the session's own context
+// produced a context that was already expired before Close was called: every
+// Close failed instantly with DeadlineExceeded, the shutdown counted the
+// session as closed anyway, and the connection stayed registered. Those
+// orphans are what later carry a dead process's netns and take down attaches
+// node-wide.
+func TestTeardownContextSurvivesSessionCancellation(t *testing.T) {
+	sessionCtx, cancel := context.WithCancel(context.Background())
+	cancel() // exactly the state teardown runs in
+
+	closeCtx, cancelClose := context.WithTimeout(context.WithoutCancel(sessionCtx), staleCloseTimeout)
+	defer cancelClose()
+
+	if err := closeCtx.Err(); err != nil {
+		t.Fatalf("close context is already dead before Close is called: %v", err)
+	}
+	deadline, ok := closeCtx.Deadline()
+	if !ok {
+		t.Fatal("close context has no deadline, so a hung Close would block shutdown")
+	}
+	if remaining := time.Until(deadline); remaining < staleCloseTimeout/2 {
+		t.Errorf("close budget is %v, want close to %v", remaining, staleCloseTimeout)
+	}
+
+	// The naive form is what shipped, and it is dead on arrival.
+	naiveCtx, cancelNaive := context.WithTimeout(sessionCtx, staleCloseTimeout)
+	defer cancelNaive()
+	if naiveCtx.Err() == nil {
+		t.Error("expected a context derived from the cancelled session to be dead; the regression guard is not testing anything")
+	}
+}
