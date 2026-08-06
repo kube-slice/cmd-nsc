@@ -17,6 +17,7 @@
 package main
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/networkservicemesh/api/pkg/api/networkservice"
@@ -126,5 +127,93 @@ func TestAdoptionPrefersTheMostRecentlyRefreshedConnection(t *testing.T) {
 	}
 	if got := candidates[0].GetPath().GetPathSegments()[0].GetId(); got != "runfix-0-4-0-NEW" {
 		t.Errorf("first candidate is %q, want the most recently refreshed one", got)
+	}
+}
+
+// The id a pod's connection carries has to be the same on every attempt. It
+// used to be "<pod>-<retry>-<index>-<random>", so a pod that reconnected -- and
+// after a broker restart every pod on the node reconnects at once -- arrived as
+// a stranger: new connection, newly allocated address, old id abandoned for
+// something to clean up later.
+func TestConnectionIDIsIdenticalAcrossRetries(t *testing.T) {
+	const (
+		pod = "pg-dcdr-dc-a-0"
+		uid = "6f1a9c34-1b2e-4d55-9d8a-7c0e2f3b4a51"
+	)
+
+	first := connectionID(pod, uid, 0)
+	for retry := 0; retry < 5; retry++ {
+		// The retry count is deliberately not an input any more.
+		if got := connectionID(pod, uid, 0); got != first {
+			t.Fatalf("attempt %d produced %q, want %q on every attempt", retry, got, first)
+		}
+	}
+	if !strings.Contains(first, uid) {
+		t.Errorf("id %q does not carry the pod UID, so it is not stable across broker restarts", first)
+	}
+}
+
+// Two pods must never share an id, in this cluster or any other sharing the
+// slice: the id is what the whole mesh uses to tell one pod's datapath from
+// another's.
+func TestConnectionIDIsUniquePerPodAndIncarnation(t *testing.T) {
+	const uidA = "6f1a9c34-1b2e-4d55-9d8a-7c0e2f3b4a51"
+	const uidB = "0c7d5e21-9a3f-4e60-8b11-2d4f6a8c9e03"
+
+	ids := map[string]string{
+		"same name, different cluster": connectionID("runfix-0", uidB, 0),
+		"this pod":                     connectionID("runfix-0", uidA, 0),
+		"different pod":                connectionID("runfix-1", uidA, 0),
+		"second network service":       connectionID("runfix-0", uidA, 1),
+	}
+
+	seen := map[string]string{}
+	for name, id := range ids {
+		if other, clash := seen[id]; clash {
+			t.Errorf("%q and %q share id %q", name, other, id)
+		}
+		seen[id] = name
+	}
+}
+
+// A pod that is genuinely replaced gets a new UID, and must get a new id with
+// it: the new incarnation lives in a different network namespace, and inheriting
+// the old connection is how the forwarder ends up entering /proc/<pid>/ns/net
+// for a dead pid.
+func TestRecreatedPodDoesNotInheritTheOldConnectionID(t *testing.T) {
+	const pod = "d1-drill-dc-a-1"
+	before := connectionID(pod, "6f1a9c34-1b2e-4d55-9d8a-7c0e2f3b4a51", 0)
+	after := connectionID(pod, "0c7d5e21-9a3f-4e60-8b11-2d4f6a8c9e03", 0)
+	if before == after {
+		t.Error("a recreated pod kept the old connection id; its namespace is gone and adopting it strands the node")
+	}
+}
+
+// belongsToPod falls back to the id when a connection carries no podName label,
+// so it has to recognise both shapes: connections created before an upgrade are
+// still live and still this pod's.
+func TestBelongsToPodRecognisesBothIDShapes(t *testing.T) {
+	const pod = "runfix-0"
+	for name, id := range map[string]string{
+		"stable id":     connectionID(pod, "6f1a9c34-1b2e-4d55-9d8a-7c0e2f3b4a51", 0),
+		"legacy id":     "runfix-0-3-0-Ab3xK9zQ",
+		"legacy retry0": "runfix-0-0-0-RDHlAa70",
+	} {
+		conn := &networkservice.Connection{
+			Path: &networkservice.Path{PathSegments: []*networkservice.PathSegment{{Name: pod, Id: id}}},
+		}
+		if !belongsToPod(conn, pod) {
+			t.Errorf("%s (%q) was not recognised as belonging to %s", name, id, pod)
+		}
+	}
+
+	// A different pod whose name is a prefix must not match.
+	conn := &networkservice.Connection{
+		Path: &networkservice.Path{PathSegments: []*networkservice.PathSegment{
+			{Name: "runfix-0-extra", Id: connectionID("runfix-0-extra", "0c7d5e21-9a3f-4e60-8b11-2d4f6a8c9e03", 0)},
+		}},
+	}
+	if belongsToPod(conn, "runfix-0") {
+		t.Error("one pod's connection was attributed to another whose name is a prefix of it")
 	}
 }

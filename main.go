@@ -209,6 +209,9 @@ type nscClient struct {
 	networkService string
 	inodeUrl       string
 	count          int32
+	// uid is the pod's Kubernetes UID. It is what makes a connection id stable
+	// across retries and unique across clusters -- see connectionID.
+	uid string
 }
 
 // validateNetworkService rejects a URL that nsurl cannot turn into a usable
@@ -501,7 +504,7 @@ func handlensmtask(parentCtx context.Context, clientConfig nscClient) error {
 		fmt.Println("****************************************")
 		fmt.Println(strings.ToUpper(u.Scheme))
 		fmt.Println("****************************************")
-		id := fmt.Sprintf("%s-%d-%d-%s", c.Name, clientConfig.count, i, shortRandomSuffix())
+		id := connectionID(c.Name, clientConfig.uid, i)
 		mech := u.Mechanism()
 		mech.Parameters["inodeURL"] = clientConfig.inodeUrl
 		fmt.Println("####################################")
@@ -545,7 +548,10 @@ func handlensmtask(parentCtx context.Context, clientConfig nscClient) error {
 		// its address and its routes survive untouched, and the slice router
 		// never has to be told anything. Only when there is nothing safe to
 		// resume do we fall through to the teardown below.
-		if adopted := adoptConnectionForPod(ctx, nsmClient, monitorClient, c.Name, clientConfig.inodeUrl, logger); adopted != nil {
+		// signalCtx for the same reason the Request below uses it: the adopted
+		// connection must be refreshed for exactly as long as this pod's
+		// session lives, and no longer.
+		if adopted := adoptConnectionForPod(signalCtx, nsmClient, monitorClient, c.Name, clientConfig.inodeUrl, logger); adopted != nil {
 			resp = adopted
 			adoptedExisting = true
 		}
@@ -785,7 +791,11 @@ func belongsToPod(conn *networkservice.Connection, podName string) bool {
 	return ok && connIDTail.MatchString(rest)
 }
 
-var connIDTail = regexp.MustCompile(`^[0-9]+-[0-9]+-`)
+// connIDTail matches what follows the pod name in a connection id: the network
+// service index and then the pod UID (connectionID), or the older
+// "<retry>-<index>-<random>" shape, since connections created before an upgrade
+// are still out there and still have to be recognised as this pod's.
+var connIDTail = regexp.MustCompile(`^[0-9]+-([0-9a-fA-F-]{36}|[0-9]+-)`)
 
 func latestExpiry(conn *networkservice.Connection) time.Time {
 	var newest time.Time
@@ -795,6 +805,35 @@ func latestExpiry(conn *networkservice.Connection) time.Time {
 		}
 	}
 	return newest
+}
+
+// connectionID is the id a pod's connection carries, for every attempt, for as
+// long as that pod exists.
+//
+// It used to be "<pod>-<retry>-<index>-<random>", which changed on every single
+// attempt. A pod that reconnected -- and after a broker restart every pod on
+// the node reconnects at once -- arrived as a stranger: a new connection, a
+// newly allocated address, and the old id left behind for something to clean up
+// later. That is where the churn came from. Every slice gateway changing
+// address is why the slice router ended up forwarding to nexthops that no
+// longer existed, and every abandoned id is one more thing to expire at the
+// wrong moment.
+//
+// The pod's Kubernetes UID gives all three properties at once. It is identical
+// across retries, so reconnecting is recognisably the same client; it is a UUID,
+// so no two pods can collide, in this cluster or any other sharing the slice;
+// and it changes when the pod is genuinely replaced, so a new incarnation --
+// which has a different network namespace -- is correctly treated as new rather
+// than inheriting a dead one's connection.
+//
+// The index distinguishes multiple network services requested by one pod.
+func connectionID(podName, podUID string, index int) string {
+	if podUID == "" {
+		// Without a UID there is nothing stable to key on. Falling back to the
+		// old shape keeps the pod working; it just loses the stability.
+		return fmt.Sprintf("%s-%d-%s", podName, index, shortRandomSuffix())
+	}
+	return fmt.Sprintf("%s-%d-%s", podName, index, podUID)
 }
 
 func shortRandomSuffix() string {
@@ -906,20 +945,25 @@ func recoverPanics(ctx context.Context, req interface{}, info *grpc.UnaryServerI
 	return handler(ctx, req)
 }
 
-func (s *server) podHasLabel(podName string, namespace string) (bool, error) {
+// podHasLabel reports whether the pod is on a slice, and returns its UID.
+//
+// The UID comes from the same lookup rather than a second one: it identifies
+// this incarnation of the pod, so it is exactly what a connection id needs to
+// be stable across retries and to change when the pod is genuinely replaced.
+func (s *server) podHasLabel(podName string, namespace string) (bool, string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	pod, err := s.clientset.CoreV1().Pods(namespace).Get(ctx, podName, metav1.GetOptions{})
 	if err != nil {
-		return false, err
+		return false, "", err
 	}
 
 	if pod.Labels == nil {
-		return false, nil
+		return false, string(pod.UID), nil
 	}
 	_, exists := pod.Labels["kubeslice.io/slice"]
-	return exists, nil
+	return exists, string(pod.UID), nil
 }
 func (s *server) ProcessPod(ctx context.Context, req *nscpb.PodRequest) (*nscpb.PodResponse, error) {
 
@@ -939,10 +983,11 @@ func (s *server) ProcessPod(ctx context.Context, req *nscpb.PodRequest) (*nscpb.
 			fmt.Errorf("pod %v is on node %v, this broker serves %v", clientSpec.podName, clientSpec.nodeName, ownNode)
 	}
 
-	check, err := s.podHasLabel(clientSpec.podName, clientSpec.namespace)
+	check, uid, err := s.podHasLabel(clientSpec.podName, clientSpec.namespace)
 	if err != nil {
 		return &nscpb.PodResponse{Status: "Error checking pod labels"}, err
 	}
+	clientSpec.uid = uid
 	if !check {
 		return &nscpb.PodResponse{Status: "Pod does not have kubeslice.io/slice label"}, nil
 	}
