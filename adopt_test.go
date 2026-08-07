@@ -302,34 +302,89 @@ func TestPreCloseKeepsTheConnectionBeingReused(t *testing.T) {
 // at roughly 0.4x its token lifetime, so an expiry well in the past means
 // renewal has stopped.
 func TestSessionHealthVerdictFromExpiry(t *testing.T) {
+	now := time.Now()
 	for name, tc := range map[string]struct {
 		expiry time.Time
 		dead   bool
 	}{
-		"freshly refreshed":              {time.Now().Add(10 * time.Minute), false},
-		"renewal due but not late":       {time.Now().Add(30 * time.Second), false},
-		"just past expiry, within grace": {time.Now().Add(-30 * time.Second), false},
-		"several renewals missed":        {time.Now().Add(-5 * time.Minute), true},
+		"freshly refreshed":              {now.Add(10 * time.Minute), false},
+		"renewal due but not late":       {now.Add(30 * time.Second), false},
+		"just past expiry, within grace": {now.Add(-30 * time.Second), false},
+		"several renewals missed":        {now.Add(-5 * time.Minute), true},
 	} {
 		conn := brokeredConnection("runfix-0", "runfix-0-0-uid", podNetNS, tc.expiry)
-		overdue := time.Since(latestExpiry(conn))
-		if got := overdue > connectionExpiryGrace; got != tc.dead {
+		overdue, got := refreshHasStopped([]*networkservice.Connection{conn}, now)
+		if got != tc.dead {
 			t.Errorf("%s: declared dead=%v, want %v (overdue by %v, grace %v)",
 				name, got, tc.dead, overdue.Truncate(time.Second), connectionExpiryGrace)
 		}
 	}
 }
 
-// The grace has to cover more than one missed renewal, or a single slow refresh
-// would tear down a working connection.
-func TestSessionHealthGraceExceedsOneRenewalInterval(t *testing.T) {
+// The verdict has to read the expiry refresh itself renews against, which is the
+// soonest on the path -- sdk refresh.after() takes the minimum across segments.
+// Reading the latest instead makes the check as slow as the most generous
+// element: cmd-forwarder-kernel defaults its token lifetime to 24h and
+// cmd-nse-vl3 to 600m, so a strand could sit for a day before anything noticed.
+func TestSessionHealthReadsTheSoonestExpiryOnThePath(t *testing.T) {
+	now := time.Now()
+	conn := brokeredConnection("runfix-0", "runfix-0-0-uid", podNetNS, now.Add(-5*time.Minute))
+	// One generous element on the path, as a forwarder on its default 24h
+	// token lifetime would be.
+	conn.Path.PathSegments = append(conn.Path.PathSegments, &networkservice.PathSegment{
+		Name:    "forwarder-kernel-mjn9x",
+		Expires: timestamppb.New(now.Add(24 * time.Hour)),
+	})
+
+	if _, stopped := refreshHasStopped([]*networkservice.Connection{conn}, now); !stopped {
+		t.Error("a strand went unnoticed because one segment on the path had a long token lifetime")
+	}
+}
+
+// A path segment with no expiry at all reads as 1970, which would condemn every
+// connection carrying one. Absent information is not evidence of a strand.
+func TestSessionHealthTreatsAMissingExpiryAsNoInformation(t *testing.T) {
+	now := time.Now()
+	conn := brokeredConnection("runfix-0", "runfix-0-0-uid", podNetNS, now.Add(10*time.Minute))
+	for _, segment := range conn.GetPath().GetPathSegments() {
+		segment.Expires = nil
+	}
+
+	if _, stopped := refreshHasStopped([]*networkservice.Connection{conn}, now); stopped {
+		t.Error("a connection with no expiry recorded was declared dead")
+	}
+}
+
+// One healthy connection is enough to leave the session alone.
+func TestSessionHealthSpareOneStrandedAmongHealthy(t *testing.T) {
+	now := time.Now()
+	conns := []*networkservice.Connection{
+		brokeredConnection("runfix-0", "runfix-0-0-uid", podNetNS, now.Add(-5*time.Minute)),
+		brokeredConnection("runfix-0", "runfix-0-1-uid", podNetNS, now.Add(10*time.Minute)),
+	}
+
+	if _, stopped := refreshHasStopped(conns, now); stopped {
+		t.Error("the session was ended while one of the pod's connections was still being refreshed")
+	}
+}
+
+// The grace has to be shorter than the polling interval is long, or a fault is
+// noticed far later than the grace implies, and it must not be so short that a
+// single late renewal tears down a working connection.
+func TestSessionHealthGraceIsWithinOneRenewalInterval(t *testing.T) {
 	// refresh renews at ~0.4x the token lifetime; tokens here are 10 minutes.
 	renewalInterval := 4 * time.Minute
 	if connectionExpiryGrace >= renewalInterval {
-		t.Errorf("grace %v is at least a full renewal interval %v; a connection would be killed before its next renewal is even due",
+		t.Errorf("grace %v is at least a full renewal interval %v; the check would not notice promptly",
 			connectionExpiryGrace, renewalInterval)
 	}
 	if connectionHealthInterval > connectionExpiryGrace {
 		t.Errorf("polling every %v cannot notice a %v grace promptly", connectionHealthInterval, connectionExpiryGrace)
+	}
+	// A live connection is renewed at 0.4x its lifetime, so its expiry is
+	// always at least 0.6x away: reaching the grace means renewal stopped a
+	// full lifetime ago, not that one renewal ran late.
+	if headroom := 6 * time.Minute; connectionExpiryGrace >= headroom {
+		t.Errorf("grace %v is not clear of the %v headroom a healthy connection always has", connectionExpiryGrace, headroom)
 	}
 }

@@ -658,6 +658,17 @@ const (
 	// to drift before the session gives up on it. refresh renews at roughly
 	// 0.4x the token lifetime, so this is several missed renewals, not one.
 	connectionExpiryGrace = 2 * time.Minute
+	// connectionMissesBeforeReattach is how many consecutive reads must find no
+	// connection for this pod before the session gives up.
+	//
+	// One is not enough. The nsmgr keeps its connections in memory only, so for
+	// a moment after it restarts it holds none for anybody, and a single read
+	// landing in that window would tear down and rebuild a pod whose nsmgr
+	// restart otherwise costs it nothing measurable. A second read a minute
+	// later distinguishes "the nsmgr was restarting" from "this pod's
+	// connection is gone" at the cost of one interval on a fault that
+	// previously lasted hours.
+	connectionMissesBeforeReattach = 2
 )
 
 // watchConnectionHealth ends the session when the pod's connection has stopped
@@ -693,6 +704,7 @@ func watchConnectionHealth(
 		ticker := time.NewTicker(connectionHealthInterval)
 		defer ticker.Stop()
 
+		misses := 0
 		for {
 			select {
 			case <-ctx.Done():
@@ -700,21 +712,36 @@ func watchConnectionHealth(
 			case <-ticker.C:
 			}
 
-			conns, err := liveConnectionsForPod(ctx, monitorClient, podName)
+			all, err := liveConnections(ctx, monitorClient)
 			if err != nil {
 				// Could not ask. Says nothing about the connection, so leave it
 				// alone: ending a healthy session because the nsmgr was briefly
-				// unreachable would be its own outage.
+				// unreachable would be its own outage. The miss count is kept
+				// rather than reset, so an unreachable nsmgr delays a verdict
+				// instead of preventing one.
 				continue
 			}
+			if len(all) == 0 {
+				// The nsmgr holds nothing for anybody. That is a statement
+				// about the nsmgr -- it restarted and has not been re-populated
+				// yet -- not about this pod, and heal is already reconnecting.
+				continue
+			}
+
+			conns := connectionsForPod(all, podName)
 			if len(conns) == 0 {
+				misses++
+				if misses < connectionMissesBeforeReattach {
+					logger.Warnf("nsmgr holds no connection for pod %v, confirming before ending the session", podName)
+					continue
+				}
 				logger.Errorf("nsmgr no longer holds a connection for pod %v, ending session so it can attach again", podName)
 				cancel()
 				return
 			}
+			misses = 0
 
-			expiry := latestExpiry(conns[0])
-			if overdue := time.Since(expiry); overdue > connectionExpiryGrace {
+			if overdue, stopped := refreshHasStopped(conns, time.Now()); stopped {
 				logger.Errorf("connection %v of pod %v has not been refreshed for %v past its expiry, ending session so it can attach again",
 					conns[0].GetId(), podName, overdue.Truncate(time.Second))
 				cancel()
@@ -724,14 +751,66 @@ func watchConnectionHealth(
 	}()
 }
 
-// liveConnectionsForPod reads the nsmgr's current connections for podName,
-// newest first. Every caller that needs the control plane's view goes through
-// here: adoption, the stale sweep, and the session health watch.
-func liveConnectionsForPod(
+// refreshHasStopped reports whether every connection the nsmgr holds for this
+// pod has drifted past the point where renewal must already have failed, and by
+// how much for the worst of them.
+//
+// The verdict reads the *soonest* expiry on the path, which is the one refresh
+// itself tracks: sdk refresh.after() takes the minimum across path segments and
+// renews at a fraction of it. Taking the latest instead would make the check as
+// slow as the most generous element on the path -- cmd-forwarder-kernel defaults
+// its token lifetime to 24h and cmd-nse-vl3 to 600m, neither set by env here --
+// so a strand could sit for a day before anything noticed, which is the fault
+// this exists to catch.
+//
+// A segment carrying no expiry at all is read as no information rather than as
+// an expiry in 1970, and one healthy connection is enough to leave the session
+// alone.
+func refreshHasStopped(conns []*networkservice.Connection, now time.Time) (time.Duration, bool) {
+	var worst time.Duration
+	for _, conn := range conns {
+		expiry, ok := earliestExpiry(conn)
+		if !ok {
+			return 0, false
+		}
+		overdue := now.Sub(expiry)
+		if overdue <= connectionExpiryGrace {
+			return 0, false
+		}
+		if overdue > worst {
+			worst = overdue
+		}
+	}
+	return worst, len(conns) > 0
+}
+
+// earliestExpiry returns the soonest expiry across a connection's path segments
+// -- what refresh renews against -- and whether any segment carried one at all.
+func earliestExpiry(conn *networkservice.Connection) (time.Time, bool) {
+	var soonest time.Time
+	for _, segment := range conn.GetPath().GetPathSegments() {
+		if segment.GetExpires() == nil {
+			continue
+		}
+		if t := segment.GetExpires().AsTime(); soonest.IsZero() || t.Before(soonest) {
+			soonest = t
+		}
+	}
+	return soonest, !soonest.IsZero()
+}
+
+// liveConnections reads the nsmgr's whole current view. Every caller that needs
+// the control plane's record goes through here: adoption, the stale sweep, and
+// the session health watch.
+//
+// The health watch wants the whole view and not just this pod's slice of it,
+// because an empty view says something different from an empty slice: the nsmgr
+// keeps connections in memory, so a view that is empty for everybody means it
+// restarted, which is no evidence at all about any one pod.
+func liveConnections(
 	ctx context.Context,
 	monitorClient networkservice.MonitorConnectionClient,
-	podName string,
-) ([]*networkservice.Connection, error) {
+) (map[string]*networkservice.Connection, error) {
 	monitorCtx, cancelMonitor := context.WithTimeout(context.WithoutCancel(ctx), staleCloseTimeout)
 	defer cancelMonitor()
 
@@ -743,7 +822,21 @@ func liveConnectionsForPod(
 	if err != nil {
 		return nil, err
 	}
-	return connectionsForPod(event.GetConnections(), podName), nil
+	return event.GetConnections(), nil
+}
+
+// liveConnectionsForPod reads the nsmgr's current connections for podName,
+// newest first.
+func liveConnectionsForPod(
+	ctx context.Context,
+	monitorClient networkservice.MonitorConnectionClient,
+	podName string,
+) ([]*networkservice.Connection, error) {
+	all, err := liveConnections(ctx, monitorClient)
+	if err != nil {
+		return nil, err
+	}
+	return connectionsForPod(all, podName), nil
 }
 
 // adoptConnectionForPod resumes the connection the nsmgr already holds for
